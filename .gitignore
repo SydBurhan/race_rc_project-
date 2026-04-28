@@ -1,5 +1,19 @@
+# Python Environment
 venv/
 __pycache__/
 *.pyc
-.vscode/
 .env
+
+# Project Data (CRITICAL: RACE dataset is too large for GitHub)
+data/raw/
+data/processed/
+
+# IDE & OS Files
+.vscode/
+.DS_Store
+
+# Saved Models 
+# Note: Your lab rubric requires submitting model checkpoints. 
+# If your .joblib files are under 100MB, leave this commented out so they push. 
+# If they exceed 100MB, uncomment the line below to ignore them, and submit via a ZIP file instead.
+# models/**/*.joblib
