@@ -1,54 +1,9 @@
-"""
-preprocessing.py  —  RACE Reading Comprehension System  (AL2002 Lab Project)
-=============================================================================
-
-Pipeline
---------
-Stage 1 — Parse raw RACE directories
-    Walks  data/raw/train/, data/raw/dev/, data/raw/test/
-    Each file is a JSON object with the schema used by the original RACE
-    dataset release:
-
-        {
-            "article":   "...",
-            "questions": ["...", "..."],
-            "options":   [["A_text","B_text","C_text","D_text"], ...],
-            "answers":   ["A", "C", ...]      # one answer per question
-        }
-
-    One question  →  one row in the DataFrame.
-
-Stage 2 — Persist CSVs
-    Saves three files to data/processed/ so the slow directory-walk
-    only happens once:
-        train.csv  |  val.csv  |  test.csv
-
-    Schema (matches project specification exactly):
-        id | article | question | A | B | C | D | answer
-
-Stage 3 — TF-IDF vectorisation
-    Corpus per row = article + article + question + A + B + C + D
-    (article repeated to up-weight passage content — TF-IDF Manual §6)
-
-    Vectorizer constraints (fixed by AL2002 project spec):
-        stop_words='english'   — removes noise dimensions
-        sublinear_tf=True      — TF = log(1 + count)
-        max_features=15000     — safe ceiling for RACE's 100K+ vocab
-
-    DATA-LEAKAGE PREVENTION
-    -------------------------
-    fit_transform()  ← training corpus ONLY
-    transform()      ← val and test (no refitting, ever)
-
-Stage 4 — Persist artefacts
-    models/model_a/tfidf_vectorizer.joblib   ← fitted vectorizer
-    data/processed/X_train.npz              ← sparse TF-IDF matrices
-    data/processed/X_val.npz
-    data/processed/X_test.npz
-    data/processed/y_train.npy              ← integer labels (0-3)
-    data/processed/y_val.npy
-    data/processed/y_test.npy   (if answers are present in test split)
-"""
+# This will be the main preproccesor for data, as files are large and may be redundant, what to do?
+# 1) Parse RACE dir, one quesrtiom, one row 
+# 2) Save files to test train val, what aboyt tts? id->art->Q->ABDC-> answer
+# 3) Vectoirzation (corpus), 
+# 4) Persist artefacts, all data that has been processed ok
+# Once done, model A can be trained :)
 
 from __future__ import annotations
 
@@ -64,29 +19,21 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+#Logging details
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Directory / file paths
-# ---------------------------------------------------------------------------
+#File dir struct
 RAW_DIR       = Path("data") / "raw"
 PROCESSED_DIR = Path("data") / "processed"
 MODEL_DIR     = Path("models") / "model_a"
 
-# Raw RACE subdirectory names.
-# The original RACE release uses "dev" for the validation split.
 RAW_SUBDIRS: dict[str, str] = {
     "train": "train",
-    "val":   "dev",    # RACE names the val split "dev" on disk
+    "val":   "dev",    # is this split?
     "test":  "test",
 }
 
@@ -96,24 +43,17 @@ CSV_PATHS: dict[str, Path] = {
 }
 
 VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.joblib"
-
-# ---------------------------------------------------------------------------
-# Project-mandated TF-IDF hyper-parameters (do not change)
-# ---------------------------------------------------------------------------
+#Project specific
 TFIDF_PARAMS: dict = dict(
     stop_words="english",
     sublinear_tf=True,
     max_features=15_000,
 )
 
-# Answer letter -> integer label
+#Map answers sequentially
 ANSWER_MAP: dict[str, int] = {"A": 0, "B": 1, "C": 2, "D": 3}
 
-
-# ===========================================================================
-# Stage 1 — Parse raw RACE directory
-# ===========================================================================
-
+#1)
 def _parse_race_file(filepath: Path, split_name: str) -> list[dict]:
     """
     Parse a single RACE JSON file and return a list of row dicts, one per
@@ -149,7 +89,7 @@ def _parse_race_file(filepath: Path, split_name: str) -> list[dict]:
     for q_idx, question in enumerate(questions):
         opts = options[q_idx] if q_idx < len(options) else ["", "", "", ""]
 
-        # Pad / trim to exactly 4 options
+        # exactly 4 options ABCD
         while len(opts) < 4:
             opts.append("")
         opts = opts[:4]
@@ -157,7 +97,7 @@ def _parse_race_file(filepath: Path, split_name: str) -> list[dict]:
         answer = answers[q_idx] if q_idx < len(answers) else None
 
         row = {
-            # Unique identifier: filename stem + question index
+            # primary key-ish, uniqueness 
             "id":       f"{split_name}_{filepath.stem}_{q_idx}",
             "article":  article,
             "question": str(question).strip(),
@@ -173,14 +113,8 @@ def _parse_race_file(filepath: Path, split_name: str) -> list[dict]:
 
 
 def parse_race_directory(split_name: str) -> pd.DataFrame:
-    """
-    Recursively walk the raw RACE subdirectory for *split_name* and
-    assemble all JSON files into a single DataFrame.
-
-    Handles both flat layouts  (data/raw/train/*.txt)  and the nested layout
-    the original RACE release ships as  (data/raw/train/high/*.txt, .../middle/*.txt).
-    Any file that json.load can parse is accepted regardless of extension.
-    """
+    # Add all files into a single DataFrame, be it high medium
+    
     subdir_name = RAW_SUBDIRS[split_name]
     root_dir    = RAW_DIR / subdir_name
 
@@ -224,10 +158,7 @@ def parse_race_directory(split_name: str) -> pd.DataFrame:
     return df
 
 
-# ===========================================================================
-# Stage 2 — Persist CSVs
-# ===========================================================================
-
+ #2) 
 def save_dataframes(
     train_df: pd.DataFrame,
     val_df:   pd.DataFrame,
@@ -241,11 +172,7 @@ def save_dataframes(
         df.to_csv(out_path, index=False, encoding="utf-8")
         log.info("Saved %s -> %s  (%d rows)", split_name, out_path, len(df))
 
-
-# ===========================================================================
-# Stage 3 — Feature engineering
-# ===========================================================================
-
+#3)
 def build_corpus(df: pd.DataFrame) -> pd.Series:
     """
     Combine article (repeated), question, and all four options into a
@@ -294,19 +221,7 @@ def vectorise(
     val_df:   pd.DataFrame,
     test_df:  pd.DataFrame,
 ) -> tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix, TfidfVectorizer]:
-    """
-    Fit a TfidfVectorizer on the training corpus only, then transform val
-    and test corpora with the already-fitted object.
-
-    Returns (X_train, X_val, X_test, fitted_vectorizer).
-
-    DATA-LEAKAGE RULE
-    -----------------
-    fit_transform()  is called EXACTLY ONCE, on train_corpus.
-    transform()      is called on val and test — it uses the vocabulary and
-                     IDF weights computed from training data only, so no
-                     information from unseen splits contaminates the features.
-    """
+   
     log.info("Building text corpora ...")
     train_corpus = build_corpus(train_df)
     val_corpus   = build_corpus(val_df)
@@ -319,11 +234,11 @@ def vectorise(
     log.info("Initialising TfidfVectorizer  params=%s", TFIDF_PARAMS)
     vectorizer = TfidfVectorizer(**TFIDF_PARAMS)
 
-    # ── FIT on training data only ──────────────────────────────────────────
+    # FIT on training data only 
     log.info("fit_transform() on training corpus ...")
     X_train: sp.csr_matrix = vectorizer.fit_transform(train_corpus)
 
-    # ── TRANSFORM val & test — NO refitting ───────────────────────────────
+    # TRANSFORM val & test  NO refitting 
     log.info("transform() on validation corpus (no refitting) ...")
     X_val:  sp.csr_matrix = vectorizer.transform(val_corpus)
 
@@ -343,10 +258,7 @@ def vectorise(
     return X_train, X_val, X_test, vectorizer
 
 
-# ===========================================================================
-# Stage 4 — Persist artefacts
-# ===========================================================================
-
+#4)
 def save_artefacts(
     vectorizer: TfidfVectorizer,
     X_train: sp.csr_matrix,
@@ -356,26 +268,18 @@ def save_artefacts(
     y_val:   Optional[np.ndarray],
     y_test:  Optional[np.ndarray],
 ) -> None:
-    """
-    Persist the vectorizer and all feature matrices / label arrays.
-
-    Matrices are kept as scipy sparse objects.  Converting to dense with
-    .toarray() on the full RACE dataset requires ~10 GB RAM — a common
-    mistake flagged in the TF-IDF Manual section 6.
-    """
+   
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Fitted vectorizer — mandatory for inference
+    
     joblib.dump(vectorizer, VECTORIZER_PATH)
     log.info("Vectorizer saved -> %s", VECTORIZER_PATH)
 
-    # Sparse feature matrices
     for name, mat in (("X_train", X_train), ("X_val", X_val), ("X_test", X_test)):
         out = PROCESSED_DIR / f"{name}.npz"
         sp.save_npz(str(out), mat)
         log.info("Saved %s -> %s", name, out)
 
-    # Integer labels
     for name, arr in (("y_train", y_train), ("y_val", y_val), ("y_test", y_test)):
         if arr is not None:
             out = PROCESSED_DIR / f"{name}.npy"
@@ -383,10 +287,8 @@ def save_artefacts(
             log.info("Saved %s -> %s  (shape %s)", name, out, arr.shape)
 
 
-# ===========================================================================
-# Orchestrator
-# ===========================================================================
 
+#Running pipeline
 def run_preprocessing() -> None:
     log.info("=" * 65)
     log.info("RACE Preprocessing Pipeline  (AL2002 Lab Project)")
@@ -395,17 +297,17 @@ def run_preprocessing() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Stage 1 : Parse raw directories ──────────────────────────────────
+    
     log.info("[Stage 1] Parsing raw RACE directories ...")
     train_df = parse_race_directory("train")
     val_df   = parse_race_directory("val")
     test_df  = parse_race_directory("test")
 
-    # ── Stage 2 : Save CSVs ───────────────────────────────────────────────
+    
     log.info("[Stage 2] Saving DataFrames as CSVs ...")
     save_dataframes(train_df, val_df, test_df)
 
-    # ── Stage 3 : TF-IDF vectorisation ────────────────────────────────────
+    
     log.info("[Stage 3] TF-IDF vectorisation ...")
     X_train, X_val, X_test, vectorizer = vectorise(train_df, val_df, test_df)
 
@@ -413,7 +315,7 @@ def run_preprocessing() -> None:
     y_val   = extract_labels(val_df,   "val")
     y_test  = extract_labels(test_df,  "test")
 
-    # ── Stage 4 : Persist artefacts ───────────────────────────────────────
+   
     log.info("[Stage 4] Saving artefacts ...")
     save_artefacts(vectorizer, X_train, X_val, X_test, y_train, y_val, y_test)
 
@@ -424,6 +326,6 @@ def run_preprocessing() -> None:
     log.info("=" * 65)
 
 
-# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     run_preprocessing()
