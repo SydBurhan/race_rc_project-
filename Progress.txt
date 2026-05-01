@@ -1,3 +1,4 @@
 Run on local 840M, and then do on colab with a larger dataset
 Preprocessing done :)
-
+Umm Model A done , now model B then supervised or app?
+lets see
