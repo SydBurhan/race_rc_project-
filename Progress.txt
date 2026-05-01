@@ -1,0 +1,3 @@
+Run on local 840M, and then do on colab with a larger dataset
+Preprocessing done :)
+
