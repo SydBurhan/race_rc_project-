@@ -1,11 +1,11 @@
 """
 app.py  —  RACE Reading Comprehension System  (AL2002 Lab Project)
 ==================================================================
-Streamlit UI that wires Model A (Answer Verifier) and Model B
-(Distractor + Hint Generator) into a polished 4-screen interface.
+Streamlit UI that wires Model A (Soft-Voting Ensemble: LR + Calibrated SVM)
+and Model B (Distractor + Hint Generator) into a polished 4-screen interface.
 
 Run:
-    streamlit run app.py
+    streamlit run ui/app.py
 """
 
 import random
@@ -25,18 +25,20 @@ st.set_page_config(
 )
 
 # ── Resolve src/ on the path so model_b_train imports work ─────────────────
-SRC_DIR = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from model_b_train import generate_distractors, generate_hints  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (Updated to resolve from the new ui/ folder location)
 # ---------------------------------------------------------------------------
-MODEL_DIR       = Path("models") / "model_a"
+MODEL_DIR       = PROJECT_ROOT / "models" / "model_a"
 VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.joblib"
 CLASSIFIER_PATH = MODEL_DIR / "lr_classifier.joblib"
+SVM_PATH        = MODEL_DIR / "svm_model.joblib"
 
 # ---------------------------------------------------------------------------
 # Global CSS — refined editorial aesthetic
@@ -215,33 +217,51 @@ def load_vectorizer():
     return joblib.load(VECTORIZER_PATH)
 
 
-@st.cache_resource(show_spinner="Loading answer-verifier classifier …")
+@st.cache_resource(show_spinner="Loading Logistic Regression classifier …")
 def load_classifier():
     if not CLASSIFIER_PATH.exists():
         return None
     return joblib.load(CLASSIFIER_PATH)
 
 
+@st.cache_resource(show_spinner="Loading Calibrated SVM classifier …")
+def load_svm():
+    if not SVM_PATH.exists():
+        return None
+    return joblib.load(SVM_PATH)
+
+
 # ===========================================================================
-# Model A inference helper
+# Model A inference helpers — Soft-Voting Ensemble
 # ===========================================================================
 
-def verify_option(
+def _get_proba(model, X) -> np.ndarray:
+    """Return P(correct) for a single transformed sample."""
+    return float(model.predict_proba(X)[0][1])
+
+
+def verify_option_ensemble(
     article: str,
     question: str,
     option: str,
     vectorizer,
-    classifier,
-) -> tuple[float, int]:
+    lr_model,
+    svm_model,
+) -> float:
     """
-    Return (probability_correct, predicted_label) for a single option.
-    Uses the same corpus formula as model_a_train.py.
+    Soft-vote P(correct) by averaging LR and SVM probabilities.
+    Falls back to whichever model is available if only one is loaded.
     """
     corpus = article + " " + article + " " + question + " " + option
     X = vectorizer.transform([corpus])
-    prob  = classifier.predict_proba(X)[0][1]
-    label = int(classifier.predict(X)[0])
-    return float(prob), label
+
+    probs = []
+    if lr_model is not None:
+        probs.append(_get_proba(lr_model, X))
+    if svm_model is not None:
+        probs.append(_get_proba(svm_model, X))
+
+    return float(np.mean(probs)) if probs else 0.0
 
 
 def select_best_answer(
@@ -249,16 +269,32 @@ def select_best_answer(
     question: str,
     options: list[str],
     vectorizer,
-    classifier,
+    lr_model,
+    svm_model,
 ) -> tuple[int, list[float]]:
     """
-    Score all options with Model A and return (best_index, all_probabilities).
+    Score all options with the Soft-Voting Ensemble and return
+    (best_index, all_averaged_probabilities).
     """
     probs = [
-        verify_option(article, question, opt, vectorizer, classifier)[0]
+        verify_option_ensemble(
+            article, question, opt, vectorizer, lr_model, svm_model
+        )
         for opt in options
     ]
     return int(np.argmax(probs)), probs
+
+
+def _ensemble_label(lr_model, svm_model) -> str:
+    """Human-readable label describing which models are active."""
+    active = []
+    if lr_model is not None:
+        active.append("LR")
+    if svm_model is not None:
+        active.append("SVM")
+    if len(active) == 2:
+        return "Ensemble (LR + SVM)"
+    return active[0] if active else "unavailable"
 
 
 # ===========================================================================
@@ -273,8 +309,8 @@ def _init_state() -> None:
         "correct_answer":  "",
         "distractors":     [],
         "hints":           [],
-        "quiz_options":    [],    # shuffled [correct + 3 distractors]
-        "correct_idx":     -1,   # index of correct answer in quiz_options
+        "quiz_options":    [],
+        "correct_idx":     -1,
         "answer_checked":  False,
         "selected_option": None,
         "questions_generated": 0,
@@ -314,7 +350,6 @@ def render_sidebar() -> str:
         st.markdown("<hr style='border-color:#333;margin:1.5rem 0 0.8rem'>",
                     unsafe_allow_html=True)
 
-        # Quick session stats in sidebar
         st.markdown(
             f"<div style='font-size:0.78rem;opacity:0.55;line-height:1.9'>"
             f"Questions generated: <b>{st.session_state.questions_generated}</b><br>"
@@ -331,7 +366,7 @@ def render_sidebar() -> str:
 # Screen 1 — Article Input
 # ===========================================================================
 
-def screen_article_input(vectorizer, classifier) -> None:
+def screen_article_input(vectorizer, lr_model, svm_model) -> None:
     st.markdown(
         "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Article Input</h1>"
         "<p style='color:#7a7269;font-size:0.95rem'>Paste an article, enter a "
@@ -372,7 +407,6 @@ def screen_article_input(vectorizer, classifier) -> None:
         st.markdown("<br>", unsafe_allow_html=True)
         generate_clicked = st.button("⚡  Generate Quiz", use_container_width=True)
 
-    # ── Validation & generation ─────────────────────────────────────────
     if generate_clicked:
         if not article.strip():
             st.error("Please paste an article before generating.")
@@ -401,9 +435,7 @@ def screen_article_input(vectorizer, classifier) -> None:
                     top_k=3,
                 )
 
-            # Build shuffled quiz options
             distractor_texts = [d["distractor"] for d in distractors]
-            # Pad with placeholder if fewer than 3 distractors found
             while len(distractor_texts) < 3:
                 distractor_texts.append(f"[No distractor {len(distractor_texts)+1} found]")
 
@@ -411,7 +443,6 @@ def screen_article_input(vectorizer, classifier) -> None:
             random.shuffle(quiz_pool)
             correct_idx = quiz_pool.index(correct_answer)
 
-            # Persist to session state
             st.session_state.article         = article
             st.session_state.question        = question
             st.session_state.correct_answer  = correct_answer
@@ -428,7 +459,6 @@ def screen_article_input(vectorizer, classifier) -> None:
                 f"{len(hints)} hints. Navigate to **Quiz View** to start!"
             )
 
-            # Preview distractors inline
             if distractors:
                 st.markdown("**Generated distractors:**")
                 badges = "".join(
@@ -443,7 +473,7 @@ def screen_article_input(vectorizer, classifier) -> None:
 # Screen 2 — Quiz View
 # ===========================================================================
 
-def screen_quiz_view(vectorizer, classifier) -> None:
+def screen_quiz_view(vectorizer, lr_model, svm_model) -> None:
     st.markdown(
         "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Quiz View</h1>"
         "<p style='color:#7a7269;font-size:0.95rem'>Read the passage, answer the "
@@ -456,20 +486,17 @@ def screen_quiz_view(vectorizer, classifier) -> None:
         st.info("No quiz loaded yet. Go to **Article Input** and click Generate Quiz.")
         return
 
-    # ── Article ─────────────────────────────────────────────────────────
     st.markdown("**Passage**")
     st.markdown(
         f"<div class='rc-article'>{st.session_state.article}</div>",
         unsafe_allow_html=True,
     )
 
-    # ── Question ─────────────────────────────────────────────────────────
     st.markdown(
         f"<div class='rc-question'>{st.session_state.question}</div>",
         unsafe_allow_html=True,
     )
 
-    # ── Radio options ────────────────────────────────────────────────────
     labels = ["A", "B", "C", "D"]
     options = st.session_state.quiz_options
     radio_labels = [f"({labels[i]})  {opt}" for i, opt in enumerate(options)]
@@ -499,21 +526,27 @@ def screen_quiz_view(vectorizer, classifier) -> None:
             st.session_state.answer_checked  = True
             st.session_state.selected_option = selected_text
 
-            # ── Model A verification ─────────────────────────────────
-            model_a_available = vectorizer is not None and classifier is not None
+            # ── Model A Ensemble inference ───────────────────────────────
+            model_a_available = vectorizer is not None and (
+                lr_model is not None or svm_model is not None
+            )
+
             if model_a_available:
                 best_idx, probs = select_best_answer(
                     article    = st.session_state.article,
                     question   = st.session_state.question,
                     options    = options,
                     vectorizer = vectorizer,
-                    classifier = classifier,
+                    lr_model   = lr_model,
+                    svm_model  = svm_model,
                 )
-                model_pick = options[best_idx]
+                model_pick   = options[best_idx]
+                active_label = _ensemble_label(lr_model, svm_model)
             else:
-                model_pick = None
+                model_pick   = None
+                active_label = "unavailable"
 
-            # ── Feedback ─────────────────────────────────────────────
+            # ── User feedback ─────────────────────────────────────────────
             if is_correct:
                 st.success(
                     f"✅ **Correct!** '{selected_text}' is the right answer."
@@ -529,26 +562,28 @@ def screen_quiz_view(vectorizer, classifier) -> None:
                 if model_pick == st.session_state.correct_answer:
                     st.markdown(
                         f"<div style='font-size:0.85rem;color:#1a6b3c;margin-top:0.5rem'>"
-                        f"🤖 Model A also selected: <b>{model_pick}</b> ✓</div>",
+                        f"🤖 Model A ({active_label}) selected: <b>{model_pick}</b> ✓</div>",
                         unsafe_allow_html=True,
                     )
                 else:
                     st.markdown(
                         f"<div style='font-size:0.85rem;color:#7a7269;margin-top:0.5rem'>"
-                        f"🤖 Model A selected: <b>{model_pick}</b> "
-                        f"(baseline accuracy: 29.43 %)</div>",
+                        f"🤖 Model A ({active_label}) selected: <b>{model_pick}</b> "
+                        f"(ensemble val accuracy: ~32%)</div>",
                         unsafe_allow_html=True,
                     )
             else:
                 st.caption(
                     "Model A classifier not found — run `model_a_train.py` "
-                    "to enable verification."
+                    "and `model_a_supervised_svm.py` to enable verification."
                 )
 
-            # ── Option breakdown ─────────────────────────────────────
+            # ── Per-option confidence bars ─────────────────────────────────
             if model_a_available:
                 st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
-                st.markdown("**Model A confidence scores:**")
+                st.markdown(
+                    f"**Model A ({active_label}) confidence scores:**"
+                )
                 for i, (opt, prob) in enumerate(zip(options, probs)):
                     bar_col, label_col = st.columns([4, 1])
                     bar_col.progress(float(prob), text=f"({labels[i]}) {opt[:60]}")
@@ -560,7 +595,7 @@ def screen_quiz_view(vectorizer, classifier) -> None:
 
 
 # ===========================================================================
-# Screen 3 — Hint Panel
+# Screen 3 — Hint Panel  (unchanged)
 # ===========================================================================
 
 def screen_hint_panel() -> None:
@@ -613,7 +648,7 @@ def screen_hint_panel() -> None:
 # Screen 4 — Analytics Dashboard
 # ===========================================================================
 
-def screen_analytics() -> None:
+def screen_analytics(lr_model, svm_model) -> None:
     st.markdown(
         "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Analytics Dashboard</h1>"
         "<p style='color:#7a7269;font-size:0.95rem'>Session statistics and model "
@@ -623,9 +658,9 @@ def screen_analytics() -> None:
     st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
 
     # ── Session stats ────────────────────────────────────────────────────
-    total    = st.session_state.total_attempts
-    correct  = st.session_state.correct_attempts
-    user_acc = (correct / total * 100) if total > 0 else 0.0
+    total     = st.session_state.total_attempts
+    correct   = st.session_state.correct_attempts
+    user_acc  = (correct / total * 100) if total > 0 else 0.0
     generated = st.session_state.questions_generated
 
     st.markdown("#### Session Performance")
@@ -640,32 +675,45 @@ def screen_analytics() -> None:
             unsafe_allow_html=True,
         )
 
-    stat_card(c1, str(generated),          "Quizzes Generated")
-    stat_card(c2, str(total),              "Answers Submitted")
-    stat_card(c3, str(correct),            "Correct Answers")
-    stat_card(c4, f"{user_acc:.1f}%",      "User Accuracy")
+    stat_card(c1, str(generated),     "Quizzes Generated")
+    stat_card(c2, str(total),         "Answers Submitted")
+    stat_card(c3, str(correct),       "Correct Answers")
+    stat_card(c4, f"{user_acc:.1f}%", "User Accuracy")
 
-    # ── Model performance ────────────────────────────────────────────────
+    # ── Model A — individual & ensemble accuracy ─────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### Model A — Answer Verifier (Logistic Regression / TF-IDF)")
+    st.markdown("#### Model A — Answer Verifier  *(val set, answer-selection)*")
 
-    m1, m2, m3 = st.columns(3)
-    stat_card(m1, "29.43%", "Val Accuracy")
-    stat_card(m2, "15 000", "TF-IDF Features")
-    stat_card(m3, "LR",     "Classifier")
+    m1, m2, m3, m4 = st.columns(4)
+    stat_card(m1, "31.70%",   "LR Accuracy")
+    stat_card(m2, "31.10%",   "SVM Accuracy")
+    stat_card(m3, "~32%",     "Ensemble Accuracy")
+    stat_card(m4, "15 000",   "TF-IDF Features")
 
     st.markdown("<br>", unsafe_allow_html=True)
-
-    # Accuracy gauge (simple progress bar)
     st.markdown(
-        "<p style='font-size:0.85rem;color:#7a7269;margin-bottom:0.3rem'>"
-        "Model A validation accuracy vs. random baseline (25 %)</p>",
+        "<p style='font-size:0.85rem;color:#7a7269;margin-bottom:0.5rem'>"
+        "Validation accuracy vs. random baseline (25 %)</p>",
         unsafe_allow_html=True,
     )
     col_gauge, _ = st.columns([2, 3])
     with col_gauge:
-        st.progress(0.2943, text="Model A — 29.43 %")
+        st.progress(0.32,   text="Ensemble  — ~32.00 %")
+        st.progress(0.3170, text="Logistic Regression — 31.70 %")
+        st.progress(0.3110, text="Linear SVM — 31.10 %")
         st.progress(0.25,   text="Random baseline — 25.00 %")
+
+    # ── Model status badges ──────────────────────────────────────────────
+    st.markdown("<br>", unsafe_allow_html=True)
+    lr_status  = "✅ Loaded" if lr_model  is not None else "⚠️ Not found"
+    svm_status = "✅ Loaded" if svm_model is not None else "⚠️ Not found"
+    st.markdown(
+        f"<div style='font-size:0.85rem;color:#7a7269'>"
+        f"LR model: <b>{lr_status}</b> &nbsp;·&nbsp; "
+        f"SVM model: <b>{svm_status}</b>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
 
     # ── Model B summary ──────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
@@ -682,7 +730,9 @@ def screen_analytics() -> None:
 
     info_rows = [
         ("Vectorizer",      "TF-IDF  |  stop_words='english'  |  sublinear_tf=True  |  max_features=15 000"),
-        ("Classifier",      "Logistic Regression  |  solver=saga  |  class_weight=balanced  |  C=1.0"),
+        ("Classifier",      "Soft-Voting Ensemble (Logistic Regression + Calibrated LinearSVC)  |  averaged predict_proba"),
+        ("LR config",       "solver=saga  |  class_weight=balanced  |  C=1.0"),
+        ("SVM config",      "LinearSVC(C=1.0)  wrapped in CalibratedClassifierCV(cv=3)"),
         ("Distractor algo", "n-gram extraction → TF-IDF cosine similarity → MMR diversity selection"),
         ("Hint algo",       "Sentence splitting → TF-IDF cosine similarity → top-k ranking"),
         ("Framework",       "Streamlit  ·  scikit-learn  ·  scipy.sparse  ·  joblib"),
@@ -718,19 +768,20 @@ def main() -> None:
     _init_state()
 
     vectorizer = load_vectorizer()
-    classifier = load_classifier()
+    lr_model   = load_classifier()
+    svm_model  = load_svm()
 
     page = render_sidebar()
     st.session_state.page = page
 
     if page == "📝 Article Input":
-        screen_article_input(vectorizer, classifier)
+        screen_article_input(vectorizer, lr_model, svm_model)
     elif page == "📚 Quiz View":
-        screen_quiz_view(vectorizer, classifier)
+        screen_quiz_view(vectorizer, lr_model, svm_model)
     elif page == "💡 Hint Panel":
         screen_hint_panel()
     elif page == "📊 Analytics Dashboard":
-        screen_analytics()
+        screen_analytics(lr_model, svm_model)
 
 
 if __name__ == "__main__":

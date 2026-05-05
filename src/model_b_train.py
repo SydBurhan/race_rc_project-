@@ -13,7 +13,8 @@ reading-comprehension UI:
         windows and word-frequency counting (no NLP libraries), then ranks
         them by TF-IDF cosine similarity to the correct answer.  A diversity
         penalty ensures the three returned distractors are distinct from each
-        other.
+        other.  A phrase-inflation post-processor ensures single-word
+        candidates are expanded into readable noun phrases from the article.
 
     generate_hints(article, question, vectorizer, top_k=3)
         Splits the article into sentences, scores each sentence by its
@@ -66,30 +67,19 @@ VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.joblib"
 # ---------------------------------------------------------------------------
 # Hyper-parameters
 # ---------------------------------------------------------------------------
-# n-gram sizes to extract as candidate phrases from the article
 NGRAM_SIZES: list[int] = [1, 2, 3]
-
-# Minimum raw frequency an n-gram must appear in the article to be a candidate
 MIN_FREQ: int = 1
-
-# Minimum character length of a candidate phrase (filters single letters, etc.)
 MIN_PHRASE_LEN: int = 3
-
-# Maximum character length of a candidate phrase
 MAX_PHRASE_LEN: int = 80
-
-# How much to penalise a candidate for being similar to an already-chosen
-# distractor.  Range [0, 1]; 1.0 = fully subtract similarity to chosen set.
 DIVERSITY_PENALTY: float = 0.6
-
-# Number of distractors to return
 N_DISTRACTORS: int = 3
-
-# Number of hint sentences to return
 N_HINTS: int = 3
-
-# Minimum words a sentence must have to be considered as a hint
 MIN_SENTENCE_WORDS: int = 5
+
+# Phrase inflation tunables
+_INFLATE_MIN_WORDS: int = 2   # inflate any distractor shorter than this
+_INFLATE_MAX_WORDS: int = 10  # cap the window size when pulling context
+_PHRASE_TARGET_WORDS: int = 3 # minimum words in the final inflated phrase
 
 
 # ===========================================================================
@@ -100,10 +90,6 @@ def _tfidf_cosine(texts_a: list[str], texts_b: list[str], vectorizer) -> np.ndar
     """
     Return a (len(texts_a), len(texts_b)) cosine-similarity matrix computed
     from TF-IDF vectors.
-
-    Both lists are transformed with the pre-fitted vectorizer (.transform()
-    only — no refitting).  The resulting sparse matrices are kept sparse
-    until cosine_similarity() densifies them internally.
     """
     vec_a = vectorizer.transform(texts_a)
     vec_b = vectorizer.transform(texts_b)
@@ -111,10 +97,162 @@ def _tfidf_cosine(texts_a: list[str], texts_b: list[str], vectorizer) -> np.ndar
 
 
 # ===========================================================================
+# Part 0 — Phrase Inflation (NEW)
+# ===========================================================================
+
+_INFLATE_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
+    "been", "have", "has", "had", "that", "this", "it", "its", "s",
+})
+
+
+def _split_sentences_simple(text: str) -> list[str]:
+    """Fast sentence splitter (no NLTK required)."""
+    return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
+
+
+def _is_strippable_stopword(token: str) -> bool:
+    """
+    Return True only if the token is a stopword AND is NOT a proper noun
+    (i.e. not capitalised).  This prevents stripping words like "Nobel",
+    "Paris", "Marie" from the edges of a phrase.
+    """
+    clean = token.rstrip(".,;:\"'()")
+    # Preserve capitalised words — they are likely proper nouns
+    if clean and clean[0].isupper():
+        return False
+    return clean.lower() in _INFLATE_STOPWORDS
+
+
+def _inflate_keyword(keyword: str, article: str, correct_answer: str) -> str:
+    """
+    Given a bare keyword (e.g. "prize"), find the tightest readable phrase
+    in the article that:
+      1. Contains the keyword
+      2. Reaches _PHRASE_TARGET_WORDS after stopword-stripping
+      3. Doesn't start/end with a (non-proper-noun) stopword
+      4. Doesn't overlap heavily with the correct answer
+
+    Falls back to a 2-word prefix grab, then to the capitalised keyword.
+    """
+    kw_lower = keyword.strip().lower()
+    correct_tokens = set(correct_answer.lower().split())
+    sentences = _split_sentences_simple(article)
+
+    best: Optional[str] = None
+    best_len = 9999
+
+    for sent in sentences:
+        if kw_lower not in sent.lower():
+            continue
+
+        # Skip sentences that mostly restate the correct answer
+        sent_tokens = set(sent.lower().split())
+        overlap = len(sent_tokens & correct_tokens) / max(len(sent_tokens), 1)
+        if overlap > 0.5:
+            continue
+
+        tokens = sent.split()
+        kw_idx = next(
+            (i for i, t in enumerate(tokens) if kw_lower in t.lower()), None
+        )
+        if kw_idx is None:
+            continue
+
+        # Slide windows around the keyword — start from up to MAX_WORDS before it
+        for left in range(max(0, kw_idx - (_INFLATE_MAX_WORDS - 1)), kw_idx + 1):
+            for right in range(
+                kw_idx + 1,
+                min(len(tokens), left + _INFLATE_MAX_WORDS) + 1,
+            ):
+                chunk = list(tokens[left:right])
+
+                # Strip leading/trailing stopwords — but preserve proper nouns
+                while chunk and _is_strippable_stopword(chunk[0]):
+                    chunk = chunk[1:]
+                while chunk and _is_strippable_stopword(chunk[-1]):
+                    chunk = chunk[:-1]
+
+                if len(chunk) < _PHRASE_TARGET_WORDS:
+                    continue
+
+                phrase = " ".join(chunk).strip(".,;:\"'()")
+
+                if len(chunk) < best_len:
+                    best = phrase
+                    best_len = len(chunk)
+
+    if best:
+        return best[0].upper() + best[1:]
+
+    # ── Fallback 1: grab the word immediately before the keyword in any
+    #   sentence (catches "Nobel Prize" → "Nobel Prize")
+    for sent in sentences:
+        if kw_lower not in sent.lower():
+            continue
+        tokens = sent.split()
+        kw_idx = next(
+            (i for i, t in enumerate(tokens) if kw_lower in t.lower()), None
+        )
+        if kw_idx is not None and kw_idx > 0:
+            phrase = " ".join(tokens[kw_idx - 1 : kw_idx + 1]).strip(".,;:\"'()")
+            if phrase:
+                return phrase[0].upper() + phrase[1:]
+
+    # ── Fallback 2: capitalised keyword as-is
+    return keyword[0].upper() + keyword[1:]
+
+
+def _inflate_distractors(
+    distractors: list[dict],
+    article: str,
+    correct_answer: str,
+) -> list[dict]:
+    """
+    Post-process the MMR-selected distractors.
+
+    Any distractor whose text is shorter than _INFLATE_MIN_WORDS words is
+    expanded to a readable phrase by pulling context from the article.
+    Distractors that are already phrase-length are returned unchanged.
+
+    Parameters
+    ----------
+    distractors    : list of {"distractor": str, "similarity": float}
+    article        : the RACE passage
+    correct_answer : used to avoid producing options that echo the answer
+
+    Returns
+    -------
+    Same list structure with distractor strings potentially expanded.
+    """
+    inflated = []
+    seen_phrases: set[str] = set()
+
+    for d in distractors:
+        text = d["distractor"]
+        word_count = len(text.split())
+
+        if word_count < _PHRASE_TARGET_WORDS:
+            expanded = _inflate_keyword(text, article, correct_answer)
+        else:
+            expanded = text[0].upper() + text[1:]   # just capitalise
+
+        # Deduplicate across inflated results
+        if expanded.lower() in seen_phrases:
+            # Try again with the original raw keyword capitalised as fallback
+            expanded = text[0].upper() + text[1:]
+
+        seen_phrases.add(expanded.lower())
+        inflated.append({"distractor": expanded, "similarity": d["similarity"]})
+
+    return inflated
+
+
+# ===========================================================================
 # Part 1 — Distractor Generation
 # ===========================================================================
 
-# English stopwords (subset) used to filter trivial single-word candidates
 _STOPWORDS: frozenset[str] = frozenset({
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
@@ -145,20 +283,6 @@ def _extract_candidate_phrases(
     """
     Extract candidate distractor phrases from the article using sliding
     n-gram windows and word-frequency counting (zero NLP dependencies).
-
-    Steps
-    -----
-    1. Tokenise the article into lowercase words.
-    2. Build n-grams of sizes in *ngram_sizes*.
-    3. Count raw frequency of each n-gram string.
-    4. Filter:
-         - frequency < min_freq → discard
-         - phrase length outside [min_len, max_len] → discard
-         - all tokens are stopwords → discard (unigrams only)
-         - phrase == correct answer (case-insensitive) → discard
-         - phrase is a substring of the correct answer → discard
-    5. Return unique phrases sorted by descending frequency (most common
-       first, so cosine-similarity ranking has a rich pool to reorder).
     """
     tokens      = _tokenise(article)
     correct_tok = _tokenise(correct_answer)
@@ -169,10 +293,9 @@ def _extract_candidate_phrases(
 
     for n in ngram_sizes:
         for i in range(len(tokens) - n + 1):
-            gram     = tokens[i : i + n]
-            phrase   = " ".join(gram)
+            gram   = tokens[i : i + n]
+            phrase = " ".join(gram)
 
-            # Skip trivial single-word stopword-only phrases
             if n == 1 and gram[0] in _STOPWORDS:
                 continue
 
@@ -192,8 +315,6 @@ def _extract_candidate_phrases(
             seen_phrases.add(phrase)
             candidates.append(phrase)
 
-    # Sort by frequency descending so the most article-prominent phrases
-    # appear first before cosine-similarity re-ranking
     candidates.sort(key=lambda p: counter[p], reverse=True)
     return candidates
 
@@ -206,30 +327,14 @@ def _mmr_select(
 ) -> list[int]:
     """
     Maximal Marginal Relevance (MMR) greedy selection.
-
-    Selects *n* indices that maximise:
-        score[i]  -  diversity_penalty * max(sim(i, already_selected))
-
-    Parameters
-    ----------
-    scores          : 1-D array of relevance scores for each candidate
-    inter_sim       : 2-D (n_candidates, n_candidates) similarity matrix
-    n               : number of items to select
-    diversity_penalty: weight of the redundancy term (0 = no penalty)
-
-    Returns
-    -------
-    List of selected indices in selection order.
     """
     remaining = list(range(len(scores)))
     selected: list[int] = []
 
     for _ in range(min(n, len(remaining))):
         if not selected:
-            # First pick: pure relevance
             best = max(remaining, key=lambda i: scores[i])
         else:
-            # Subsequent picks: relevance minus diversity penalty
             def mmr_score(i: int) -> float:
                 redundancy = max(inter_sim[i, j] for j in selected)
                 return scores[i] - diversity_penalty * redundancy
@@ -259,43 +364,27 @@ def generate_distractors(
     1. Extract candidate phrases from the article (n-grams, frequency-filtered).
     2. Keep the top *pool_size* candidates by frequency to limit computation.
     3. Compute TF-IDF cosine similarity between each candidate and the
-       correct answer.  High similarity → topically related (plausible).
-    4. Use MMR (Maximal Marginal Relevance) to pick *n* candidates that are
-       similar to the correct answer but dissimilar to each other.
-    5. Return selected phrases with their relevance scores.
-
-    Parameters
-    ----------
-    article         : the RACE passage text
-    question        : the question string (used to filter the article context)
-    correct_answer  : the gold answer text
-    vectorizer      : pre-fitted TfidfVectorizer
-    n               : number of distractors to return (default 3)
-    diversity_penalty: MMR lambda — higher = more diverse output
-    pool_size       : max candidate phrases to score with cosine similarity
+       correct answer.
+    4. Use MMR to pick *n* candidates that are similar to the correct answer
+       but dissimilar to each other.
+    5. Inflate any bare keywords into readable phrases using article context.
+    6. Return selected phrases with their relevance scores.
 
     Returns
     -------
     List of dicts: [{"distractor": str, "similarity": float}, ...]
     """
-    # Step 1 — candidate extraction
     candidates = _extract_candidate_phrases(article, correct_answer)
 
     if not candidates:
         log.warning("No candidate phrases found in article.")
         return []
 
-    # Step 2 — limit pool for efficiency
     pool = candidates[:pool_size]
 
-    # Step 3 — cosine similarity to correct answer
-    # Shape: (len(pool), 1) -> squeeze to 1-D
     sim_to_answer = _tfidf_cosine(pool, [correct_answer], vectorizer).squeeze(axis=1)
+    inter_sim     = _tfidf_cosine(pool, pool, vectorizer)
 
-    # Step 4 — inter-candidate similarity matrix (for MMR diversity penalty)
-    inter_sim = _tfidf_cosine(pool, pool, vectorizer)
-
-    # Step 5 — MMR greedy selection
     selected_idx = _mmr_select(
         scores=sim_to_answer,
         inter_sim=inter_sim,
@@ -303,13 +392,14 @@ def generate_distractors(
         diversity_penalty=diversity_penalty,
     )
 
-    results = [
-        {
-            "distractor": pool[i],
-            "similarity": float(sim_to_answer[i]),
-        }
+    raw_results = [
+        {"distractor": pool[i], "similarity": float(sim_to_answer[i])}
         for i in selected_idx
     ]
+
+    # ── Phrase inflation: expand bare keywords into readable phrases ────────
+    results = _inflate_distractors(raw_results, article, correct_answer)
+
     return results
 
 
@@ -320,13 +410,8 @@ def generate_distractors(
 def _split_sentences(text: str) -> list[str]:
     """
     Split *text* into sentences using punctuation heuristics.
-
-    Uses a regex that splits on  .  !  ?  followed by whitespace + capital,
-    which works well for RACE passages without requiring NLTK.
     """
-    # Split on sentence-ending punctuation followed by whitespace
     raw = re.split(r"(?<=[.!?])\s+", text.strip())
-    # Filter very short fragments
     sentences = [
         s.strip()
         for s in raw
@@ -344,28 +429,6 @@ def generate_hints(
     """
     Extract the top-*top_k* sentences from the article that are most relevant
     to the question, returned as ranked extractive hints.
-
-    Algorithm
-    ---------
-    1. Split the article into sentences.
-    2. Compute TF-IDF cosine similarity between each sentence and the question.
-    3. Rank sentences by similarity (descending).
-    4. Return the top *top_k* as hint dicts, preserving their original
-       position in the article so the UI can display them in context order
-       if desired.
-
-    Parameters
-    ----------
-    article    : the RACE passage text
-    question   : the question string
-    vectorizer : pre-fitted TfidfVectorizer
-    top_k      : number of hint sentences to return
-
-    Returns
-    -------
-    List of dicts (sorted by similarity descending):
-        [{"rank": int, "sentence": str, "similarity": float,
-          "position": int}, ...]
     """
     sentences = _split_sentences(article)
 
@@ -373,20 +436,16 @@ def generate_hints(
         log.warning("No sentences extracted from article.")
         return []
 
-    # Cosine similarity: (n_sentences, 1) -> squeeze to 1-D
     sims = _tfidf_cosine(sentences, [question], vectorizer).squeeze(axis=1)
 
-    # Pair each sentence with its similarity score and original position
     scored = [
         {"position": i, "sentence": s, "similarity": float(sims[i])}
         for i, s in enumerate(sentences)
     ]
 
-    # Sort by similarity descending, take top_k
     scored.sort(key=lambda x: x["similarity"], reverse=True)
     top = scored[:top_k]
 
-    # Add rank (1 = most relevant)
     for rank, item in enumerate(top, start=1):
         item["rank"] = rank
 
@@ -448,92 +507,43 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Model B demo — distractor & hint generation on one test row."
     )
-    parser.add_argument(
-        "--row",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Row index in test.csv to use.  Default: random.",
-    )
-    parser.add_argument(
-        "--vectorizer",
-        type=str,
-        default=str(VECTORIZER_PATH),
-        metavar="PATH",
-        help=f"Path to fitted vectorizer.  Default: {VECTORIZER_PATH}",
-    )
-    parser.add_argument(
-        "--n-distractors",
-        type=int,
-        default=N_DISTRACTORS,
-        metavar="N",
-        help=f"Number of distractors to generate.  Default: {N_DISTRACTORS}",
-    )
-    parser.add_argument(
-        "--n-hints",
-        type=int,
-        default=N_HINTS,
-        metavar="N",
-        help=f"Number of hint sentences to surface.  Default: {N_HINTS}",
-    )
+    parser.add_argument("--row",         type=int, default=None, metavar="N")
+    parser.add_argument("--vectorizer",  type=str, default=str(VECTORIZER_PATH))
+    parser.add_argument("--n-distractors", type=int, default=N_DISTRACTORS)
+    parser.add_argument("--n-hints",     type=int, default=N_HINTS)
     args = parser.parse_args()
 
-    # ── Load assets ─────────────────────────────────────────────────────
     vectorizer = load_vectorizer(Path(args.vectorizer))
     row        = load_test_row(row_index=args.row)
 
     article  = str(row.get("article",  "")).strip()
     question = str(row.get("question", "")).strip()
-    answer   = str(row.get("answer",   "")).strip()         # letter: A/B/C/D
-    opt_map  = {
-        "A": str(row.get("A", "")),
-        "B": str(row.get("B", "")),
-        "C": str(row.get("C", "")),
-        "D": str(row.get("D", "")),
-    }
+    answer   = str(row.get("answer",   "")).strip()
+    opt_map  = {k: str(row.get(k, "")) for k in "ABCD"}
     correct_text = opt_map.get(answer, "")
 
-    # ── Print context ────────────────────────────────────────────────────
     _banner("CONTEXT")
     print(f"Question  : {question}")
     print(f"Answer    : ({answer}) {correct_text}")
     print(f"\nArticle snippet (first 400 chars):\n{article[:400]} ...")
 
-    # ── Run distractor generation ─────────────────────────────────────────
     _banner("DISTRACTOR GENERATION")
-    print(
-        "Algorithm : n-gram candidate extraction → TF-IDF cosine similarity "
-        "→ MMR diversity selection\n"
-    )
-
     distractors = generate_distractors(
-        article        = article,
-        question       = question,
-        correct_answer = correct_text,
-        vectorizer     = vectorizer,
-        n              = args.n_distractors,
+        article=article, question=question,
+        correct_answer=correct_text, vectorizer=vectorizer,
+        n=args.n_distractors,
     )
-
     if distractors:
         for i, d in enumerate(distractors, start=1):
             print(f"  Distractor {i}  (sim={d['similarity']:.4f}) : {d['distractor']}")
     else:
         print("  [No distractors generated — article may be too short.]")
 
-    # ── Run hint generation ───────────────────────────────────────────────
     _banner("HINT GENERATION")
-    print(
-        "Algorithm : sentence splitting → TF-IDF cosine similarity to "
-        "question → top-k ranking\n"
-    )
-
     hints = generate_hints(
-        article    = article,
-        question   = question,
-        vectorizer = vectorizer,
-        top_k      = args.n_hints,
+        article=article, question=question,
+        vectorizer=vectorizer, top_k=args.n_hints,
     )
-
     if hints:
         for h in hints:
             print(f"  Hint #{h['rank']}  (sim={h['similarity']:.4f},  "
@@ -543,10 +553,6 @@ def main() -> None:
         print("  [No hints generated — article may be too short.]")
 
     _banner("DONE")
-    print(
-        "Tip: integrate generate_distractors() and generate_hints() into "
-        "src/inference.py for the UI."
-    )
 
 
 if __name__ == "__main__":

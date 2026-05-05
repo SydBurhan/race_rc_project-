@@ -1,0 +1,5 @@
+model,n_clusters,silhouette,purity
+K-Means (K=2),2,0.0443,0.75
+K-Means (K=4),4,0.0389,0.75
+K-Means (K=8),8,0.0327,0.75
+K-Means (K=16),16,0.0512,0.75
