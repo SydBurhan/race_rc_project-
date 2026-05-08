@@ -33,6 +33,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.model_a_generator import FlanT5Generator, clean_passage
+from src.model_a_train    import ModelAVerifier             # Traditional ML verifier
 from src.model_b_distractor import ModelBPipeline          # Classical ML
 from src.evaluate_nlp import score_single
 
@@ -81,6 +82,16 @@ def load_model_a() -> FlanT5Generator:
     return FlanT5Generator()
 
 
+@st.cache_resource(show_spinner="Loading Model A verifier (Traditional ML) …")
+def load_verifier() -> ModelAVerifier | None:
+    """Load the traditional ML ensemble verifier. Returns None gracefully if
+    models haven't been trained yet (run model_a_train.py first)."""
+    try:
+        return ModelAVerifier.load()
+    except SystemExit:
+        return None
+
+
 @st.cache_resource(show_spinner="Initialising Model B (Classical ML) …")
 def load_model_b() -> ModelBPipeline:
     return ModelBPipeline()
@@ -121,6 +132,7 @@ def _init_state():
         "hints_revealed":   0,              # 0–3
         "session_log":      [],             # list of per-inference dicts
         "race_samples":     [],
+        "current_sample":   None,           # RACE sample dict for current passage (or None)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -179,10 +191,22 @@ def _run_pipeline(passage: str) -> dict:
     question = a_result["question"]
     answer   = a_result["answer"]
 
+    # ── Ground-truth options from RACE sample (None for custom-pasted text) ──
+    # Used by Model B for live P/R/F1 and by NLP eval for real reference scoring.
+    sample = st.session_state.get("current_sample")
+    gt_options = (
+        {"A": sample["A"], "B": sample["B"], "C": sample["C"], "D": sample["D"]}
+        if sample else None
+    )
+    reference_question = sample["question"] if sample else None
+
     # ── Model B: generate distractors + hints ───────────────────────────────
     with st.spinner("Model B (Classical ML): generating distractors & hints …"):
         t0 = time.time()
-        b_result = model_b.run_pipeline(passage, question, answer)
+        b_result = model_b.run_pipeline(
+            passage, question, answer,
+            ground_truth_options=gt_options,   # <-- real scoring, not hardcoded
+        )
         latency_b = round(time.time() - t0, 3)
 
     distractors = b_result["distractors"]    # list of 3 strings
@@ -194,18 +218,30 @@ def _run_pipeline(passage: str) -> dict:
     correct_label = ["A", "B", "C", "D"][options.index(answer)]
     option_map = dict(zip(["A", "B", "C", "D"], options))
 
+    # ── NLP metrics: score generated question vs RACE reference question ──────
+    # Fix: was score_single(answer, answer) which always returns 1.0.
+    # Now scores the Model A generated question against the true RACE question
+    # when a sample is loaded; gracefully returns zeros for custom passages.
+    if reference_question:
+        nlp_metrics = score_single(question, reference_question)
+    else:
+        nlp_metrics = {"bleu_1": 0.0, "bleu_2": 0.0, "bleu_3": 0.0, "bleu_4": 0.0,
+                       "rouge_l_precision": 0.0, "rouge_l_recall": 0.0, "rouge_l_f1": 0.0,
+                       "meteor": 0.0, "num_samples": 0}
+
     result = {
-        "passage":       passage,
-        "question":      question,
-        "answer":        answer,
-        "correct_label": correct_label,
-        "option_map":    option_map,
-        "hints":         hints,
-        "latency_a":     latency_a,
-        "latency_b":     latency_b,
-        "distractors":   distractors,
-        # NLP metrics scored against answer (self-evaluation proxy)
-        "nlp_metrics":   score_single(answer, answer),   # placeholder; real eval uses RACE refs
+        "passage":            passage,
+        "question":           question,
+        "answer":             answer,
+        "correct_label":      correct_label,
+        "option_map":         option_map,
+        "hints":              hints,
+        "latency_a":          latency_a,
+        "latency_b":          latency_b,
+        "distractors":        b_result["distractors"],
+        "b_metrics":          b_result["b_metrics"],   # live P/R/F1 from evaluate_row
+        "nlp_metrics":        nlp_metrics,             # real hypothesis vs reference
+        "has_race_reference": sample is not None,
     }
     return result
 
@@ -227,7 +263,8 @@ def screen_input():
                 st.session_state.race_samples = load_race_samples()
             if st.session_state.race_samples:
                 sample = random.choice(st.session_state.race_samples)
-                st.session_state.passage = sample["article"]
+                st.session_state.passage        = sample["article"]
+                st.session_state.current_sample = sample   # keep for ground-truth scoring
             else:
                 st.warning("RACE dataset unavailable. Paste text manually.")
 
@@ -319,13 +356,58 @@ def screen_quiz():
     if st.session_state.answer_checked and st.session_state.user_choice:
         chosen  = st.session_state.user_choice
         correct = result["correct_label"]
+        chosen_text = result["option_map"][chosen]
+
+        # ── Model A Verifier prediction ──────────────────────────────────────
+        # Pass (passage, question, selected option text) through the traditional
+        # ML ensemble — this satisfies §4.1 verification sub-task requirement.
+        verifier: ModelAVerifier | None = load_verifier()
+        if verifier is not None:
+            verifier_prob  = verifier.predict_proba(
+                result["passage"], result["question"], chosen_text
+            )
+            verifier_pred  = int(verifier_prob >= 0.5)   # 1 = predicts correct
+            verifier_label = "Correct ✓" if verifier_pred == 1 else "Incorrect ✗"
+
+            # Ground-truth label for this choice (1 if user picked the right option)
+            ground_truth_label = 1 if chosen == correct else 0
+
+            # Log for analytics dashboard accumulation
+            st.session_state.setdefault("verifier_log", []).append({
+                "y_true": ground_truth_label,
+                "y_pred": verifier_pred,
+                "prob":   round(verifier_prob, 4),
+            })
+
+        # ── Colour-coded result (ground truth) ──────────────────────────────
         if chosen == correct:
-            st.markdown(f'<p class="correct-badge">✅ Correct! The answer is {correct}: {result["option_map"][correct]}</p>', unsafe_allow_html=True)
+            st.markdown(
+                f'<p class="correct-badge">✅ Correct! '
+                f'The answer is {correct}: {result["option_map"][correct]}</p>',
+                unsafe_allow_html=True,
+            )
             st.balloons()
         else:
-            st.markdown(f'<p class="wrong-badge">❌ Incorrect. You chose {chosen}. The correct answer is {correct}: {result["option_map"][correct]}</p>', unsafe_allow_html=True)
+            st.markdown(
+                f'<p class="wrong-badge">❌ Incorrect. You chose {chosen}. '
+                f'The correct answer is {correct}: {result["option_map"][correct]}</p>',
+                unsafe_allow_html=True,
+            )
 
-        st.markdown('<span class="ai-badge">⚠️ AI-extracted answer — verify against passage</span>', unsafe_allow_html=True)
+        # ── Model A Verifier verdict ─────────────────────────────────────────
+        if verifier is not None:
+            agree = (verifier_pred == 1) == (chosen == correct)
+            st.markdown(
+                f"**Model A Verifier** (Traditional ML ensemble) — "
+                f"predicted your choice as **{verifier_label}** "
+                f"(confidence: {verifier_prob:.2%}) · "
+                f"{'Agrees with ground truth ✓' if agree else 'Disagrees with ground truth ✗'}"
+            )
+        else:
+            st.caption("Model A verifier not loaded — run `python src/model_a_train.py` first.")
+
+        st.markdown('<span class="ai-badge">⚠️ AI-extracted answer — verify against passage</span>',
+                    unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -388,6 +470,48 @@ def screen_analytics():
     result = st.session_state.pipeline_result
     log    = st.session_state.session_log
 
+    # ── Model A — Verification Classification Metrics ────────────────────────
+    st.subheader("Model A — Verification Metrics (Traditional ML Ensemble)")
+    st.caption(
+        "Accuracy, Macro F1, and Confusion Matrix from the LR + SVM + NB soft-vote "
+        "verifier. Accumulates across all 'Check Answer' clicks this session."
+    )
+
+    verifier_log = st.session_state.get("verifier_log", [])
+    if not verifier_log:
+        st.info("Use **Check Answer** on Screen 2 to accumulate verifier predictions.")
+    else:
+        import numpy as _np
+        from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+        y_true = _np.array([e["y_true"] for e in verifier_log])
+        y_pred = _np.array([e["y_pred"] for e in verifier_log])
+
+        acc     = accuracy_score(y_true, y_pred)
+        macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        prec    = f1_score(y_true, y_pred, average="binary", pos_label=1,
+                           zero_division=0)
+        rec     = f1_score(y_true, y_pred, average="binary", pos_label=1,
+                           zero_division=0)
+        cm      = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+        col_v1, col_v2, col_v3, col_v4 = st.columns(4)
+        col_v1.metric("Accuracy",      f"{acc:.3f}",      help="Fraction of correct verifier predictions")
+        col_v2.metric("Macro F1",      f"{macro_f1:.3f}", help="Handles class imbalance (§4.5)")
+        col_v3.metric("Precision",     f"{prec:.3f}",     help="Of predicted-correct, how many were right")
+        col_v4.metric("Samples",       len(verifier_log), help="Check Answer clicks this session")
+
+        # Confusion Matrix
+        st.markdown("**Confusion Matrix** — Verifier predictions vs ground truth")
+        tn, fp_v, fn_v, tp_v = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+        col_cm_a, col_cm_b, col_cm_c, col_cm_d = st.columns(4)
+        col_cm_a.metric("True Positives",  int(tp_v), help="Verifier correctly predicted correct answer")
+        col_cm_b.metric("True Negatives",  int(tn),   help="Verifier correctly predicted wrong answer")
+        col_cm_c.metric("False Positives", int(fp_v), help="Verifier said correct when actually wrong")
+        col_cm_d.metric("False Negatives", int(fn_v), help="Verifier said wrong when actually correct")
+
+    st.divider()
+
     # ── Model A — NLP Metrics ─────────────────────────────────────────────────
     st.subheader("Model A — NLP Generation Metrics (BLEU · ROUGE-L · METEOR)")
     st.markdown(
@@ -433,11 +557,49 @@ def screen_analytics():
     st.caption("Precision / Recall / F1 measure how well the TF-IDF ranker selects plausible-but-wrong distractors.")
 
     if result:
-        b_metrics = st.session_state.pipeline_result.get("b_metrics", {})
-        col_b1, col_b2, col_b3 = st.columns(3)
-        col_b1.metric("Distractor Precision", f"{b_metrics.get('precision', 0.0):.3f}")
-        col_b2.metric("Distractor Recall",    f"{b_metrics.get('recall', 0.0):.3f}")
-        col_b3.metric("Distractor F1",        f"{b_metrics.get('f1', 0.0):.3f}")
+        b_metrics = result.get("b_metrics", {})
+        has_ref   = b_metrics.get("has_reference", False)
+
+        if not has_ref:
+            st.info(
+                "💡 Metrics require a RACE ground-truth reference. "
+                "Load a **Random RACE Sample** on Screen 1 to see live scores."
+            )
+        else:
+            col_b1, col_b2, col_b3 = st.columns(3)
+            col_b1.metric("Distractor Precision", f"{b_metrics.get('precision', 0.0):.3f}")
+            col_b2.metric("Distractor Recall",    f"{b_metrics.get('recall',    0.0):.3f}")
+            col_b3.metric("Distractor F1",        f"{b_metrics.get('f1',        0.0):.3f}")
+
+            # ── Confusion Matrix ─────────────────────────────────────────────
+            tp = b_metrics.get("tp", 0)
+            fp = b_metrics.get("fp", 0)
+            fn = b_metrics.get("fn", 0)
+
+            st.markdown("**Pseudo-Confusion Matrix** — Generated vs Ground-Truth Distractors")
+            st.caption(
+                "TP = generated distractor matched a GT option · "
+                "FP = generated distractor had no GT match · "
+                "FN = GT distractor the model missed · "
+                "TN = undefined for open-ended generation"
+            )
+
+            import pandas as _pd
+            cm_df = _pd.DataFrame(
+                {
+                    "Pred: Match": [tp, fp],
+                    "Pred: No Match (TN undefined)": ["N/A", "N/A"],
+                },
+                index=["GT: Has matching option (TP/FN)", "GT: No matching option (FP)"],
+            )
+            # Display as simple metric cards instead of a dataframe for clarity
+            col_cm1, col_cm2, col_cm3 = st.columns(3)
+            col_cm1.metric("True Positives (TP)",  tp,
+                           help="Generated distractors that overlap a GT distractor")
+            col_cm2.metric("False Positives (FP)", fp,
+                           help="Generated distractors with no matching GT option")
+            col_cm3.metric("False Negatives (FN)", fn,
+                           help="GT distractors the model failed to cover")
 
     st.divider()
 
