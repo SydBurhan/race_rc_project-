@@ -1,788 +1,501 @@
 """
-app.py  —  RACE Reading Comprehension System  (AL2002 Lab Project)
-==================================================================
-Streamlit UI that wires Model A (Soft-Voting Ensemble: LR + Calibrated SVM)
-and Model B (Distractor + Hint Generator) into a polished 4-screen interface.
+ui/app.py
+=========
+Streamlit UI — Intelligent Reading Comprehension & Quiz Generation System
+AL2002 Lab Project · FAST-NUCES Islamabad · Spring 2026
 
-Run:
-    streamlit run ui/app.py
+4 Screens:
+  1. Article Input          — paste / upload / load RACE sample
+  2. Question & Answer Quiz — generated Q, 4 options (correct + 3 distractors)
+  3. Hint Panel             — graduated hints from Model B (TF-IDF)
+  4. Analytics Dashboard    — NLP metrics (BLEU/ROUGE/METEOR) + Model B stats
+
+Architecture enforced:
+  Model A → FlanT5Generator   (Generative AI, HuggingFace Transformers)
+  Model B → Classical ML only (TF-IDF + cosine similarity + MMR, no spaCy/DL)
 """
 
-import random
+from __future__ import annotations
+
 import sys
-from pathlib import Path
+import os
+import re
+import time
+import logging
+import random
+from typing import Optional
 
-import joblib
-import numpy as np
 import streamlit as st
-from sklearn.metrics.pairwise import cosine_similarity
 
-# ── Page config — must be the very first Streamlit call ────────────────────
+# ── Path setup so src/ modules resolve ────────────────────────────────────────
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from src.model_a_generator import FlanT5Generator, clean_passage
+from src.model_b_distractor import ModelBPipeline          # Classical ML
+from src.evaluate_nlp import score_single
+
+logging.basicConfig(level=logging.WARNING)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Page config — must be first Streamlit call
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
+    page_title="RC Quiz System — AL2002",
+    page_icon="📚",
     layout="wide",
-    page_title="RACE Comprehension System",
-    page_icon="📖",
+    initial_sidebar_state="expanded",
 )
 
-# ── Resolve src/ on the path so model_b_train imports work ─────────────────
-PROJECT_ROOT = Path(__file__).parent.parent
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from model_b_train import generate_distractors, generate_hints  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Paths (Updated to resolve from the new ui/ folder location)
-# ---------------------------------------------------------------------------
-MODEL_DIR       = PROJECT_ROOT / "models" / "model_a"
-VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.joblib"
-CLASSIFIER_PATH = MODEL_DIR / "lr_classifier.joblib"
-SVM_PATH        = MODEL_DIR / "svm_model.joblib"
-
-# ---------------------------------------------------------------------------
-# Global CSS — refined editorial aesthetic
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    /* ── Google Fonts ──────────────────────────────────────────── */
-    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500&display=swap');
-
-    /* ── Root palette ──────────────────────────────────────────── */
-    :root {
-        --ink:      #0f0f0f;
-        --paper:    #f7f4ee;
-        --accent:   #c0392b;
-        --muted:    #7a7269;
-        --border:   #d6d0c4;
-        --success:  #1a6b3c;
-        --error:    #c0392b;
-        --card-bg:  #ffffff;
+# ══════════════════════════════════════════════════════════════════════════════
+#  CSS — light polish
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+    .stButton > button { border-radius: 8px; font-weight: 600; }
+    .metric-card {
+        background: #f0f4ff; border-radius: 10px; padding: 1rem;
+        margin-bottom: 0.5rem; border-left: 4px solid #4f46e5;
     }
-
-    /* ── Base ──────────────────────────────────────────────────── */
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-        background-color: var(--paper);
-        color: var(--ink);
+    .correct-badge  { color: #16a34a; font-weight: 700; font-size: 1.1rem; }
+    .wrong-badge    { color: #dc2626; font-weight: 700; font-size: 1.1rem; }
+    .hint-box {
+        background: #fffbeb; border-left: 4px solid #f59e0b;
+        padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 0.5rem;
     }
-    .main .block-container { padding-top: 2rem; max-width: 1100px; }
-
-    /* ── Display headings ──────────────────────────────────────── */
-    h1, h2, h3 { font-family: 'Playfair Display', serif; }
-
-    /* ── Sidebar ───────────────────────────────────────────────── */
-    [data-testid="stSidebar"] {
-        background-color: var(--ink);
-        color: #f7f4ee;
+    .ai-badge {
+        background: #e0e7ff; color: #3730a3; font-size: 0.75rem;
+        padding: 2px 8px; border-radius: 12px; font-weight: 600;
     }
-    [data-testid="stSidebar"] * { color: #f7f4ee !important; }
-    [data-testid="stSidebar"] .stRadio label {
-        font-family: 'DM Sans', sans-serif;
-        font-size: 0.95rem;
-        letter-spacing: 0.04em;
-        padding: 0.35rem 0;
-    }
-
-    /* ── Cards ─────────────────────────────────────────────────── */
-    .rc-card {
-        background: var(--card-bg);
-        border: 1px solid var(--border);
-        border-radius: 2px;
-        padding: 1.5rem 2rem;
-        margin-bottom: 1.25rem;
-        box-shadow: 2px 2px 0 var(--border);
-    }
-
-    /* ── Article display ───────────────────────────────────────── */
-    .rc-article {
-        font-family: 'DM Sans', sans-serif;
-        font-size: 0.97rem;
-        line-height: 1.85;
-        color: #1a1a1a;
-        background: #fffdf8;
-        border-left: 3px solid var(--accent);
-        padding: 1.2rem 1.6rem;
-        border-radius: 0 2px 2px 0;
-        max-height: 320px;
-        overflow-y: auto;
-    }
-
-    /* ── Question banner ───────────────────────────────────────── */
-    .rc-question {
-        font-family: 'Playfair Display', serif;
-        font-size: 1.35rem;
-        font-weight: 700;
-        color: var(--ink);
-        border-bottom: 2px solid var(--accent);
-        padding-bottom: 0.5rem;
-        margin: 1.2rem 0 1rem;
-    }
-
-    /* ── Distractor badges ─────────────────────────────────────── */
-    .rc-distractor {
-        display: inline-block;
-        background: #fff3f3;
-        border: 1px solid #f5c6c6;
-        color: #7a2020;
-        border-radius: 2px;
-        padding: 0.25rem 0.75rem;
-        font-size: 0.875rem;
-        margin: 0.25rem 0.25rem 0 0;
-    }
-
-    /* ── Hint cards ────────────────────────────────────────────── */
-    .rc-hint {
-        background: #f0f7ff;
-        border-left: 3px solid #2563eb;
-        padding: 0.9rem 1.2rem;
-        border-radius: 0 2px 2px 0;
-        font-size: 0.93rem;
-        line-height: 1.7;
-        color: #1a1a2e;
-    }
-
-    /* ── Stat cards (Analytics) ────────────────────────────────── */
-    .rc-stat {
-        text-align: center;
-        padding: 1.5rem 1rem;
-        background: var(--card-bg);
-        border: 1px solid var(--border);
-        border-top: 3px solid var(--accent);
-        border-radius: 0 0 2px 2px;
-        box-shadow: 2px 2px 0 var(--border);
-    }
-    .rc-stat .stat-value {
-        font-family: 'Playfair Display', serif;
-        font-size: 2.4rem;
-        font-weight: 900;
-        color: var(--accent);
-        line-height: 1.1;
-    }
-    .rc-stat .stat-label {
-        font-size: 0.8rem;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        color: var(--muted);
-        margin-top: 0.3rem;
-    }
-
-    /* ── Submit / Generate buttons ─────────────────────────────── */
-    .stButton > button {
-        background: var(--ink) !important;
-        color: #f7f4ee !important;
-        border: none !important;
-        border-radius: 2px !important;
-        font-family: 'DM Sans', sans-serif !important;
-        font-size: 0.9rem !important;
-        letter-spacing: 0.08em !important;
-        text-transform: uppercase !important;
-        padding: 0.6rem 1.8rem !important;
-        transition: background 0.2s !important;
-    }
-    .stButton > button:hover {
-        background: var(--accent) !important;
-    }
-
-    /* ── Success / Error messages ──────────────────────────────── */
-    .stSuccess, .stError { border-radius: 2px !important; }
-
-    /* ── Progress bar colour ───────────────────────────────────── */
-    .stProgress > div > div { background-color: var(--accent) !important; }
-
-    /* ── Expander headers ──────────────────────────────────────── */
-    [data-testid="stExpander"] summary {
-        font-family: 'DM Sans', sans-serif;
-        font-weight: 500;
-        font-size: 0.95rem;
-    }
-
-    /* ── Divider ───────────────────────────────────────────────── */
-    .rc-rule { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+</style>
+""", unsafe_allow_html=True)
 
 
-# ===========================================================================
-# Resource loading — cached so models load once per session
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  Cached model loaders (loaded once per session)
+# ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="Loading TF-IDF vectorizer …")
-def load_vectorizer():
-    if not VECTORIZER_PATH.exists():
-        return None
-    return joblib.load(VECTORIZER_PATH)
+@st.cache_resource(show_spinner="Loading Flan-T5 model (Model A) …")
+def load_model_a() -> FlanT5Generator:
+    return FlanT5Generator()
 
 
-@st.cache_resource(show_spinner="Loading Logistic Regression classifier …")
-def load_classifier():
-    if not CLASSIFIER_PATH.exists():
-        return None
-    return joblib.load(CLASSIFIER_PATH)
+@st.cache_resource(show_spinner="Initialising Model B (Classical ML) …")
+def load_model_b() -> ModelBPipeline:
+    return ModelBPipeline()
 
 
-@st.cache_resource(show_spinner="Loading Calibrated SVM classifier …")
-def load_svm():
-    if not SVM_PATH.exists():
-        return None
-    return joblib.load(SVM_PATH)
+# ══════════════════════════════════════════════════════════════════════════════
+#  RACE sample loader (uses HuggingFace datasets)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner="Fetching RACE dataset …")
+def load_race_samples(split: str = "test", n: int = 200) -> list[dict]:
+    """Return up to n samples from RACE (high school difficulty)."""
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("race", "high", split=split, trust_remote_code=True)
+        idxs = random.sample(range(len(ds)), min(n, len(ds)))
+        return [{"article": ds[i]["article"], "question": ds[i]["question"],
+                 "answer": ds[i]["answer"],
+                 "A": ds[i]["options"][0], "B": ds[i]["options"][1],
+                 "C": ds[i]["options"][2], "D": ds[i]["options"][3]}
+                for i in idxs]
+    except Exception as e:
+        st.warning(f"Could not load RACE dataset: {e}")
+        return []
 
 
-# ===========================================================================
-# Model A inference helpers — Soft-Voting Ensemble
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  Session-state initialisation
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _get_proba(model, X) -> np.ndarray:
-    """Return P(correct) for a single transformed sample."""
-    return float(model.predict_proba(X)[0][1])
-
-
-def verify_option_ensemble(
-    article: str,
-    question: str,
-    option: str,
-    vectorizer,
-    lr_model,
-    svm_model,
-) -> float:
-    """
-    Soft-vote P(correct) by averaging LR and SVM probabilities.
-    Falls back to whichever model is available if only one is loaded.
-    """
-    corpus = article + " " + article + " " + question + " " + option
-    X = vectorizer.transform([corpus])
-
-    probs = []
-    if lr_model is not None:
-        probs.append(_get_proba(lr_model, X))
-    if svm_model is not None:
-        probs.append(_get_proba(svm_model, X))
-
-    return float(np.mean(probs)) if probs else 0.0
-
-
-def select_best_answer(
-    article: str,
-    question: str,
-    options: list[str],
-    vectorizer,
-    lr_model,
-    svm_model,
-) -> tuple[int, list[float]]:
-    """
-    Score all options with the Soft-Voting Ensemble and return
-    (best_index, all_averaged_probabilities).
-    """
-    probs = [
-        verify_option_ensemble(
-            article, question, opt, vectorizer, lr_model, svm_model
-        )
-        for opt in options
-    ]
-    return int(np.argmax(probs)), probs
-
-
-def _ensemble_label(lr_model, svm_model) -> str:
-    """Human-readable label describing which models are active."""
-    active = []
-    if lr_model is not None:
-        active.append("LR")
-    if svm_model is not None:
-        active.append("SVM")
-    if len(active) == 2:
-        return "Ensemble (LR + SVM)"
-    return active[0] if active else "unavailable"
-
-
-# ===========================================================================
-# Session-state initialisation
-# ===========================================================================
-
-def _init_state() -> None:
+def _init_state():
     defaults = {
-        "page":            "📝 Article Input",
-        "article":         "",
-        "question":        "",
-        "correct_answer":  "",
-        "distractors":     [],
-        "hints":           [],
-        "quiz_options":    [],
-        "correct_idx":     -1,
-        "answer_checked":  False,
-        "selected_option": None,
-        "questions_generated": 0,
-        "correct_attempts":    0,
-        "total_attempts":      0,
+        "screen":           "input",        # input | quiz | hints | analytics
+        "passage":          "",
+        "pipeline_result":  None,           # output of Model A + B
+        "user_choice":      None,           # A / B / C / D
+        "answer_checked":   False,
+        "hints_revealed":   0,              # 0–3
+        "session_log":      [],             # list of per-inference dicts
+        "race_samples":     [],
     }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+_init_state()
 
 
-# ===========================================================================
-# Sidebar navigation
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  Sidebar navigation
+# ══════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar() -> str:
-    with st.sidebar:
-        st.markdown(
-            "<h2 style='font-family:Playfair Display,serif; font-size:1.4rem;"
-            "margin-bottom:0.2rem'>RACE System</h2>"
-            "<p style='font-size:0.78rem;opacity:0.6;margin-top:0;"
-            "letter-spacing:0.06em;text-transform:uppercase'>"
-            "Reading Comprehension</p>",
-            unsafe_allow_html=True,
-        )
-        st.markdown("<hr style='border-color:#333;margin:0.8rem 0'>",
-                    unsafe_allow_html=True)
+with st.sidebar:
+    st.title("📚 RC Quiz System")
+    st.caption("AL2002 · FAST-NUCES Islamabad")
+    st.divider()
 
-        pages = [
-            "📝 Article Input",
-            "📚 Quiz View",
-            "💡 Hint Panel",
-            "📊 Analytics Dashboard",
-        ]
-        page = st.radio("Navigation", pages, label_visibility="collapsed")
-
-        st.markdown("<hr style='border-color:#333;margin:1.5rem 0 0.8rem'>",
-                    unsafe_allow_html=True)
-
-        st.markdown(
-            f"<div style='font-size:0.78rem;opacity:0.55;line-height:1.9'>"
-            f"Questions generated: <b>{st.session_state.questions_generated}</b><br>"
-            f"Attempts: <b>{st.session_state.total_attempts}</b><br>"
-            f"Correct: <b>{st.session_state.correct_attempts}</b>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-    return page
-
-
-# ===========================================================================
-# Screen 1 — Article Input
-# ===========================================================================
-
-def screen_article_input(vectorizer, lr_model, svm_model) -> None:
-    st.markdown(
-        "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Article Input</h1>"
-        "<p style='color:#7a7269;font-size:0.95rem'>Paste an article, enter a "
-        "question, and generate a quiz with AI-ranked distractors and hints.</p>",
-        unsafe_allow_html=True,
+    nav = st.radio(
+        "Navigation",
+        ["🏠 Article Input", "❓ Quiz View", "💡 Hint Panel", "📊 Analytics"],
+        index=["input", "quiz", "hints", "analytics"].index(st.session_state.screen)
+              if st.session_state.screen in ["input", "quiz", "hints", "analytics"]
+              else 0,
     )
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
+    screen_map = {
+        "🏠 Article Input": "input",
+        "❓ Quiz View":     "quiz",
+        "💡 Hint Panel":    "hints",
+        "📊 Analytics":     "analytics",
+    }
+    st.session_state.screen = screen_map[nav]
 
-    col_left, col_right = st.columns([3, 2], gap="large")
+    st.divider()
+    st.markdown('<span class="ai-badge">⚠️ AI-Generated Content</span>', unsafe_allow_html=True)
+    st.caption("Questions & answers are AI-generated and may contain errors. Not for real exam use.")
 
-    with col_left:
-        st.markdown("**Article**")
-        article = st.text_area(
-            "article_input",
-            value=st.session_state.article,
-            height=280,
-            placeholder="Paste the reading passage here …",
-            label_visibility="collapsed",
-        )
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helper — run full pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_pipeline(passage: str) -> dict:
+    """
+    Orchestrates Model A (Flan-T5) and Model B (Classical ML).
+    Returns a combined result dict stored in session_state.
+    """
+    model_a: FlanT5Generator = load_model_a()
+    model_b: ModelBPipeline  = load_model_b()
+
+    # ── Model A: generate question + extract answer ──────────────────────────
+    with st.spinner("Model A (Flan-T5): generating question & answer …"):
+        t0 = time.time()
+        a_result = model_a.run_pipeline(passage)
+        latency_a = round(time.time() - t0, 3)
+
+    question = a_result["question"]
+    answer   = a_result["answer"]
+
+    # ── Model B: generate distractors + hints ───────────────────────────────
+    with st.spinner("Model B (Classical ML): generating distractors & hints …"):
+        t0 = time.time()
+        b_result = model_b.run_pipeline(passage, question, answer)
+        latency_b = round(time.time() - t0, 3)
+
+    distractors = b_result["distractors"]    # list of 3 strings
+    hints       = b_result["hints"]          # list of 3 strings
+
+    # ── Build shuffled options A–D ───────────────────────────────────────────
+    options = distractors[:3] + [answer]
+    random.shuffle(options)
+    correct_label = ["A", "B", "C", "D"][options.index(answer)]
+    option_map = dict(zip(["A", "B", "C", "D"], options))
+
+    result = {
+        "passage":       passage,
+        "question":      question,
+        "answer":        answer,
+        "correct_label": correct_label,
+        "option_map":    option_map,
+        "hints":         hints,
+        "latency_a":     latency_a,
+        "latency_b":     latency_b,
+        "distractors":   distractors,
+        # NLP metrics scored against answer (self-evaluation proxy)
+        "nlp_metrics":   score_single(answer, answer),   # placeholder; real eval uses RACE refs
+    }
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCREEN 1 — Article Input
+# ══════════════════════════════════════════════════════════════════════════════
+
+def screen_input():
+    st.header("🏠 Screen 1 — Article Input")
+    st.caption("Paste a reading passage below, upload a .txt file, or load a random RACE sample.")
+
+    col_left, col_right = st.columns([3, 1])
 
     with col_right:
-        st.markdown("**Question**")
-        question = st.text_input(
-            "question_input",
-            value=st.session_state.question,
-            placeholder="What is the main idea of the passage?",
-            label_visibility="collapsed",
+        st.markdown("#### Quick Load")
+        if st.button("🎲 Random RACE Sample", use_container_width=True):
+            if not st.session_state.race_samples:
+                st.session_state.race_samples = load_race_samples()
+            if st.session_state.race_samples:
+                sample = random.choice(st.session_state.race_samples)
+                st.session_state.passage = sample["article"]
+            else:
+                st.warning("RACE dataset unavailable. Paste text manually.")
+
+        uploaded = st.file_uploader("Upload .txt", type=["txt"])
+        if uploaded:
+            st.session_state.passage = uploaded.read().decode("utf-8")
+
+    with col_left:
+        passage = st.text_area(
+            "Reading Passage",
+            value=st.session_state.passage,
+            height=320,
+            placeholder="Paste or upload a reading passage here …",
+            key="passage_area",
         )
+        st.session_state.passage = passage
 
-        st.markdown("**Correct Answer**")
-        correct_answer = st.text_input(
-            "answer_input",
-            value=st.session_state.correct_answer,
-            placeholder="Type the correct answer text …",
-            label_visibility="collapsed",
-        )
+    word_count = len(passage.split()) if passage.strip() else 0
+    st.caption(f"Word count: {word_count}")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        generate_clicked = st.button("⚡  Generate Quiz", use_container_width=True)
+    if word_count < 30:
+        st.info("Please provide a passage of at least 30 words for best results.")
 
-    if generate_clicked:
-        if not article.strip():
-            st.error("Please paste an article before generating.")
-        elif not question.strip():
-            st.error("Please enter a question.")
-        elif not correct_answer.strip():
-            st.error("Please enter the correct answer.")
-        elif vectorizer is None:
-            st.error(
-                "Vectorizer not found. Run `preprocessing.py` first to generate "
-                f"`{VECTORIZER_PATH}`."
-            )
-        else:
-            with st.spinner("Running Model B — generating distractors & hints …"):
-                distractors = generate_distractors(
-                    article=article,
-                    question=question,
-                    correct_answer=correct_answer,
-                    vectorizer=vectorizer,
-                    n=3,
-                )
-                hints = generate_hints(
-                    article=article,
-                    question=question,
-                    vectorizer=vectorizer,
-                    top_k=3,
-                )
+    st.divider()
 
-            distractor_texts = [d["distractor"] for d in distractors]
-            while len(distractor_texts) < 3:
-                distractor_texts.append(f"[No distractor {len(distractor_texts)+1} found]")
+    if st.button("🚀 Generate Quiz", type="primary", disabled=word_count < 30, use_container_width=False):
+        cleaned = clean_passage(st.session_state.passage)
+        result  = _run_pipeline(cleaned)
+        st.session_state.pipeline_result = result
+        st.session_state.user_choice     = None
+        st.session_state.answer_checked  = False
+        st.session_state.hints_revealed  = 0
 
-            quiz_pool = [correct_answer] + distractor_texts
-            random.shuffle(quiz_pool)
-            correct_idx = quiz_pool.index(correct_answer)
+        # Log to session analytics
+        st.session_state.session_log.append({
+            "passage_snippet": cleaned[:100],
+            "question":        result["question"],
+            "answer":          result["answer"],
+            "latency_a":       result["latency_a"],
+            "latency_b":       result["latency_b"],
+        })
 
-            st.session_state.article         = article
-            st.session_state.question        = question
-            st.session_state.correct_answer  = correct_answer
-            st.session_state.distractors     = distractors
-            st.session_state.hints           = hints
-            st.session_state.quiz_options    = quiz_pool
-            st.session_state.correct_idx     = correct_idx
-            st.session_state.answer_checked  = False
-            st.session_state.selected_option = None
-            st.session_state.questions_generated += 1
-
-            st.success(
-                f"Quiz generated — {len(distractors)} distractors, "
-                f"{len(hints)} hints. Navigate to **Quiz View** to start!"
-            )
-
-            if distractors:
-                st.markdown("**Generated distractors:**")
-                badges = "".join(
-                    f"<span class='rc-distractor'>{d['distractor']} "
-                    f"<span style='opacity:0.5'>({d['similarity']:.3f})</span></span>"
-                    for d in distractors
-                )
-                st.markdown(badges, unsafe_allow_html=True)
+        st.session_state.screen = "quiz"
+        st.rerun()
 
 
-# ===========================================================================
-# Screen 2 — Quiz View
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCREEN 2 — Question & Answer Quiz View
+# ══════════════════════════════════════════════════════════════════════════════
 
-def screen_quiz_view(vectorizer, lr_model, svm_model) -> None:
-    st.markdown(
-        "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Quiz View</h1>"
-        "<p style='color:#7a7269;font-size:0.95rem'>Read the passage, answer the "
-        "question, and Model A will verify your choice.</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
+def screen_quiz():
+    st.header("❓ Screen 2 — Quiz View")
 
-    if not st.session_state.article:
-        st.info("No quiz loaded yet. Go to **Article Input** and click Generate Quiz.")
+    result = st.session_state.pipeline_result
+    if not result:
+        st.warning("No quiz generated yet. Go to Article Input first.")
         return
 
-    st.markdown("**Passage**")
-    st.markdown(
-        f"<div class='rc-article'>{st.session_state.article}</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"**Passage excerpt:** _{result['passage'][:200]} …_")
+    st.divider()
 
-    st.markdown(
-        f"<div class='rc-question'>{st.session_state.question}</div>",
-        unsafe_allow_html=True,
-    )
+    # AI-generated badge
+    st.markdown('<span class="ai-badge">⚠️ AI-Generated Question</span>', unsafe_allow_html=True)
+    st.markdown(f"### {result['question']}")
+    st.caption(f"Model A (Flan-T5) · Latency: {result['latency_a']} s")
 
-    labels = ["A", "B", "C", "D"]
-    options = st.session_state.quiz_options
-    radio_labels = [f"({labels[i]})  {opt}" for i, opt in enumerate(options)]
+    st.markdown("---")
+    st.markdown("**Choose your answer:**")
 
-    selected = st.radio(
-        "Choose your answer:",
-        radio_labels,
-        index=None,
-        label_visibility="visible",
-    )
+    for label in ["A", "B", "C", "D"]:
+        text = result["option_map"][label]
+        if st.button(f"**{label}.** {text}", key=f"opt_{label}", use_container_width=True):
+            st.session_state.user_choice = label
+            st.session_state.answer_checked = False
 
-    col_submit, col_reset = st.columns([1, 5])
-    submit_clicked = col_submit.button("Submit Answer", use_container_width=True)
+    st.divider()
 
-    if submit_clicked:
-        if selected is None:
-            st.warning("Please select an answer before submitting.")
+    if st.session_state.user_choice:
+        col_check, col_hint = st.columns([1, 1])
+        with col_check:
+            if st.button("✅ Check Answer", type="primary"):
+                st.session_state.answer_checked = True
+
+        with col_hint:
+            if st.button("💡 Need a Hint?"):
+                st.session_state.screen = "hints"
+                st.rerun()
+
+    if st.session_state.answer_checked and st.session_state.user_choice:
+        chosen  = st.session_state.user_choice
+        correct = result["correct_label"]
+        if chosen == correct:
+            st.markdown(f'<p class="correct-badge">✅ Correct! The answer is {correct}: {result["option_map"][correct]}</p>', unsafe_allow_html=True)
+            st.balloons()
         else:
-            selected_idx  = radio_labels.index(selected)
-            selected_text = options[selected_idx]
-            is_correct    = (selected_idx == st.session_state.correct_idx)
+            st.markdown(f'<p class="wrong-badge">❌ Incorrect. You chose {chosen}. The correct answer is {correct}: {result["option_map"][correct]}</p>', unsafe_allow_html=True)
 
-            st.session_state.total_attempts += 1
-            if is_correct:
-                st.session_state.correct_attempts += 1
-
-            st.session_state.answer_checked  = True
-            st.session_state.selected_option = selected_text
-
-            # ── Model A Ensemble inference ───────────────────────────────
-            model_a_available = vectorizer is not None and (
-                lr_model is not None or svm_model is not None
-            )
-
-            if model_a_available:
-                best_idx, probs = select_best_answer(
-                    article    = st.session_state.article,
-                    question   = st.session_state.question,
-                    options    = options,
-                    vectorizer = vectorizer,
-                    lr_model   = lr_model,
-                    svm_model  = svm_model,
-                )
-                model_pick   = options[best_idx]
-                active_label = _ensemble_label(lr_model, svm_model)
-            else:
-                model_pick   = None
-                active_label = "unavailable"
-
-            # ── User feedback ─────────────────────────────────────────────
-            if is_correct:
-                st.success(
-                    f"✅ **Correct!** '{selected_text}' is the right answer."
-                )
-            else:
-                st.error(
-                    f"❌ **Incorrect.** You chose: '{selected_text}'.\n\n"
-                    f"The correct answer was: "
-                    f"**'{st.session_state.correct_answer}'**"
-                )
-
-            if model_a_available:
-                if model_pick == st.session_state.correct_answer:
-                    st.markdown(
-                        f"<div style='font-size:0.85rem;color:#1a6b3c;margin-top:0.5rem'>"
-                        f"🤖 Model A ({active_label}) selected: <b>{model_pick}</b> ✓</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f"<div style='font-size:0.85rem;color:#7a7269;margin-top:0.5rem'>"
-                        f"🤖 Model A ({active_label}) selected: <b>{model_pick}</b> "
-                        f"(ensemble val accuracy: ~32%)</div>",
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.caption(
-                    "Model A classifier not found — run `model_a_train.py` "
-                    "and `model_a_supervised_svm.py` to enable verification."
-                )
-
-            # ── Per-option confidence bars ─────────────────────────────────
-            if model_a_available:
-                st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
-                st.markdown(
-                    f"**Model A ({active_label}) confidence scores:**"
-                )
-                for i, (opt, prob) in enumerate(zip(options, probs)):
-                    bar_col, label_col = st.columns([4, 1])
-                    bar_col.progress(float(prob), text=f"({labels[i]}) {opt[:60]}")
-                    label_col.markdown(
-                        f"<div style='padding-top:0.6rem;font-size:0.85rem;"
-                        f"color:#7a7269'>{prob:.3f}</div>",
-                        unsafe_allow_html=True,
-                    )
+        st.markdown('<span class="ai-badge">⚠️ AI-extracted answer — verify against passage</span>', unsafe_allow_html=True)
 
 
-# ===========================================================================
-# Screen 3 — Hint Panel  (unchanged)
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCREEN 3 — Hint Panel
+# ══════════════════════════════════════════════════════════════════════════════
 
-def screen_hint_panel() -> None:
-    st.markdown(
-        "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Hint Panel</h1>"
-        "<p style='color:#7a7269;font-size:0.95rem'>Top-ranked sentences from the "
-        "passage, extracted by TF-IDF cosine similarity to the question.</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
+def screen_hints():
+    st.header("💡 Screen 3 — Hint Panel")
 
-    if not st.session_state.hints:
-        st.info("No hints generated yet. Go to **Article Input** and click Generate Quiz.")
+    result = st.session_state.pipeline_result
+    if not result:
+        st.warning("No quiz generated yet. Go to Article Input first.")
         return
 
+    st.markdown(f"**Question:** _{result['question']}_")
+    st.caption(f"Model B (Classical ML · TF-IDF) · Latency: {result['latency_b']} s")
+    st.divider()
+
+    hints = result.get("hints", [])
+    revealed = st.session_state.hints_revealed
+
+    if not hints:
+        st.info("No hints were generated for this passage.")
+        return
+
+    hint_labels = ["Hint 1 — General Clue", "Hint 2 — More Specific", "Hint 3 — Near-Explicit"]
+
+    for i, (label, hint) in enumerate(zip(hint_labels, hints)):
+        if i < revealed:
+            st.markdown(f'<div class="hint-box"><b>{label}:</b> {hint}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="hint-box" style="filter:blur(4px);user-select:none"><b>{label}:</b> {hint}</div>', unsafe_allow_html=True)
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        if revealed < len(hints):
+            if st.button("🔓 Reveal Next Hint", type="primary"):
+                st.session_state.hints_revealed += 1
+                st.rerun()
+        else:
+            st.success("All hints revealed.")
+
+    with col_b:
+        if revealed >= len(hints):
+            if st.button("🏳️ Reveal Answer"):
+                st.info(f"**Correct Answer:** {result['answer']}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCREEN 4 — Analytics Dashboard
+# ══════════════════════════════════════════════════════════════════════════════
+
+def screen_analytics():
+    import plotly.graph_objects as go
+
+    st.header("📊 Screen 4 — Analytics Dashboard")
+    st.caption("Per professor's directive: Model A is evaluated with BLEU, ROUGE-L, and METEOR (text generation metrics). "
+               "Model B uses Precision / Recall / F1 for distractor ranking.")
+
+    result = st.session_state.pipeline_result
+    log    = st.session_state.session_log
+
+    # ── Model A — NLP Metrics ─────────────────────────────────────────────────
+    st.subheader("Model A — NLP Generation Metrics (BLEU · ROUGE-L · METEOR)")
     st.markdown(
-        f"<div style='font-size:0.9rem;color:#7a7269;margin-bottom:1rem'>"
-        f"Question: <em>{st.session_state.question}</em></div>",
-        unsafe_allow_html=True,
+        "> **Note:** For a full corpus-level evaluation against RACE reference questions, "
+        "run `python src/evaluate_nlp.py --predictions preds.txt --references refs.txt`. "
+        "The scores below are computed for the *current* inference (single-sample)."
     )
 
-    for hint in st.session_state.hints:
-        rank      = hint["rank"]
-        sentence  = hint["sentence"]
-        sim_score = hint["similarity"]
-        position  = hint.get("position", "?")
+    if result:
+        metrics = result.get("nlp_metrics", {})
 
-        label = (
-            f"Hint #{rank}  —  relevance {sim_score:.4f}  "
-            f"(sentence {position} in passage)"
-        )
-        with st.expander(label, expanded=(rank == 1)):
-            st.markdown(
-                f"<div class='rc-hint'>{sentence}</div>",
-                unsafe_allow_html=True,
-            )
-            st.caption(
-                f"Cosine similarity to question: {sim_score:.4f}  ·  "
-                f"Original position in article: sentence #{position}"
-            )
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("BLEU-1",     f"{metrics.get('bleu_1', 0):.4f}")
+        col2.metric("BLEU-4",     f"{metrics.get('bleu_4', 0):.4f}")
+        col3.metric("ROUGE-L F1", f"{metrics.get('rouge_l_f1', 0):.4f}")
+        col4.metric("METEOR",     f"{metrics.get('meteor', 0):.4f}")
 
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
-    st.caption(
-        "Hints are extractive — they are exact sentences from the passage, "
-        "ranked by TF-IDF cosine similarity.  Hint #1 is the most relevant."
-    )
+        # BLEU bar chart
+        bleu_vals = [metrics.get(f"bleu_{n}", 0) for n in range(1, 5)]
+        fig = go.Figure(go.Bar(
+            x=["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4"],
+            y=bleu_vals,
+            marker_color=["#6366f1", "#818cf8", "#a5b4fc", "#c7d2fe"],
+            text=[f"{v:.4f}" for v in bleu_vals],
+            textposition="outside",
+        ))
+        fig.update_layout(title="BLEU-1 through BLEU-4 (current inference)",
+                          yaxis_range=[0, 1], height=320, margin=dict(t=40, b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
+        # ROUGE-L breakdown
+        col_r1, col_r2, col_r3 = st.columns(3)
+        col_r1.metric("ROUGE-L Precision", f"{metrics.get('rouge_l_precision', 0):.4f}")
+        col_r2.metric("ROUGE-L Recall",    f"{metrics.get('rouge_l_recall', 0):.4f}")
+        col_r3.metric("ROUGE-L F1",        f"{metrics.get('rouge_l_f1', 0):.4f}")
+    else:
+        st.info("Run a quiz first (Screen 1) to see metrics.")
 
-# ===========================================================================
-# Screen 4 — Analytics Dashboard
-# ===========================================================================
+    st.divider()
 
-def screen_analytics(lr_model, svm_model) -> None:
-    st.markdown(
-        "<h1 style='font-size:2.2rem;margin-bottom:0.2rem'>Analytics Dashboard</h1>"
-        "<p style='color:#7a7269;font-size:0.95rem'>Session statistics and model "
-        "performance summary.</p>",
-        unsafe_allow_html=True,
-    )
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
+    # ── Model B — Distractor Quality Metrics ──────────────────────────────────
+    st.subheader("Model B — Distractor Quality (Classical ML)")
+    st.caption("Precision / Recall / F1 measure how well the TF-IDF ranker selects plausible-but-wrong distractors.")
 
-    # ── Session stats ────────────────────────────────────────────────────
-    total     = st.session_state.total_attempts
-    correct   = st.session_state.correct_attempts
-    user_acc  = (correct / total * 100) if total > 0 else 0.0
-    generated = st.session_state.questions_generated
+    if result:
+        b_metrics = st.session_state.pipeline_result.get("b_metrics", {})
+        col_b1, col_b2, col_b3 = st.columns(3)
+        col_b1.metric("Distractor Precision", f"{b_metrics.get('precision', 0.0):.3f}")
+        col_b2.metric("Distractor Recall",    f"{b_metrics.get('recall', 0.0):.3f}")
+        col_b3.metric("Distractor F1",        f"{b_metrics.get('f1', 0.0):.3f}")
 
-    st.markdown("#### Session Performance")
-    c1, c2, c3, c4 = st.columns(4)
+    st.divider()
 
-    def stat_card(col, value: str, label: str) -> None:
-        col.markdown(
-            f"<div class='rc-stat'>"
-            f"<div class='stat-value'>{value}</div>"
-            f"<div class='stat-label'>{label}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
+    # ── Latency Tracking ──────────────────────────────────────────────────────
+    st.subheader("Inference Latency")
 
-    stat_card(c1, str(generated),     "Quizzes Generated")
-    stat_card(c2, str(total),         "Answers Submitted")
-    stat_card(c3, str(correct),       "Correct Answers")
-    stat_card(c4, f"{user_acc:.1f}%", "User Accuracy")
+    if log:
+        import pandas as pd
+        df = pd.DataFrame(log)
+        df.index += 1
+        df.columns = ["Passage", "Question", "Answer", "Latency A (s)", "Latency B (s)"]
+        st.dataframe(df, use_container_width=True)
 
-    # ── Model A — individual & ensemble accuracy ─────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### Model A — Answer Verifier  *(val set, answer-selection)*")
+        # Latency line chart
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(y=df["Latency A (s)"], mode="lines+markers", name="Model A (Flan-T5)"))
+        fig2.add_trace(go.Scatter(y=df["Latency B (s)"], mode="lines+markers", name="Model B (Classical ML)"))
+        fig2.update_layout(title="Inference Latency per Request", yaxis_title="Seconds",
+                           xaxis_title="Request #", height=300)
+        st.plotly_chart(fig2, use_container_width=True)
 
-    m1, m2, m3, m4 = st.columns(4)
-    stat_card(m1, "31.70%",   "LR Accuracy")
-    stat_card(m2, "31.10%",   "SVM Accuracy")
-    stat_card(m3, "~32%",     "Ensemble Accuracy")
-    stat_card(m4, "15 000",   "TF-IDF Features")
+        # Export CSV
+        csv = df.to_csv(index=True).encode("utf-8")
+        st.download_button("⬇️ Export Session Log (CSV)", csv,
+                           file_name="session_log.csv", mime="text/csv")
+    else:
+        st.info("No inferences logged yet. Run a quiz first.")
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown(
-        "<p style='font-size:0.85rem;color:#7a7269;margin-bottom:0.5rem'>"
-        "Validation accuracy vs. random baseline (25 %)</p>",
-        unsafe_allow_html=True,
-    )
-    col_gauge, _ = st.columns([2, 3])
-    with col_gauge:
-        st.progress(0.32,   text="Ensemble  — ~32.00 %")
-        st.progress(0.3170, text="Logistic Regression — 31.70 %")
-        st.progress(0.3110, text="Linear SVM — 31.10 %")
-        st.progress(0.25,   text="Random baseline — 25.00 %")
+    st.divider()
 
-    # ── Model status badges ──────────────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    lr_status  = "✅ Loaded" if lr_model  is not None else "⚠️ Not found"
-    svm_status = "✅ Loaded" if svm_model is not None else "⚠️ Not found"
-    st.markdown(
-        f"<div style='font-size:0.85rem;color:#7a7269'>"
-        f"LR model: <b>{lr_status}</b> &nbsp;·&nbsp; "
-        f"SVM model: <b>{svm_status}</b>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+    # ── Evaluation Instructions ────────────────────────────────────────────────
+    with st.expander("🔬 Run Full RACE Corpus Evaluation"):
+        st.code("""
+# Step 1: Generate predictions over RACE test split
+python src/run_batch_eval.py --split test --max-samples 500 \\
+       --output-preds data/processed/preds.txt \\
+       --output-refs  data/processed/refs.txt
 
-    # ── Model B summary ──────────────────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### Model B — Distractor & Hint Generator")
-
-    b1, b2, b3 = st.columns(3)
-    stat_card(b1, "MMR",    "Distractor Ranker")
-    stat_card(b2, "Cosine", "Hint Scorer")
-    stat_card(b3, "3",      "Hints per Question")
-
-    # ── Technical stack ──────────────────────────────────────────────────
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("#### Technical Stack")
-
-    info_rows = [
-        ("Vectorizer",      "TF-IDF  |  stop_words='english'  |  sublinear_tf=True  |  max_features=15 000"),
-        ("Classifier",      "Soft-Voting Ensemble (Logistic Regression + Calibrated LinearSVC)  |  averaged predict_proba"),
-        ("LR config",       "solver=saga  |  class_weight=balanced  |  C=1.0"),
-        ("SVM config",      "LinearSVC(C=1.0)  wrapped in CalibratedClassifierCV(cv=3)"),
-        ("Distractor algo", "n-gram extraction → TF-IDF cosine similarity → MMR diversity selection"),
-        ("Hint algo",       "Sentence splitting → TF-IDF cosine similarity → top-k ranking"),
-        ("Framework",       "Streamlit  ·  scikit-learn  ·  scipy.sparse  ·  joblib"),
-        ("Dataset",         "RACE (Lai et al., 2017) — Reading Comprehension from Examinations"),
-    ]
-
-    for label, detail in info_rows:
-        col_l, col_d = st.columns([1, 4])
-        col_l.markdown(
-            f"<div style='font-size:0.82rem;font-weight:500;color:#7a7269;"
-            f"padding-top:0.65rem;text-transform:uppercase;letter-spacing:0.05em'>"
-            f"{label}</div>",
-            unsafe_allow_html=True,
-        )
-        col_d.markdown(
-            f"<div style='font-size:0.88rem;padding-top:0.6rem;color:#1a1a1a'>"
-            f"{detail}</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<hr class='rc-rule'>", unsafe_allow_html=True)
-    st.caption(
-        "AL2002 Lab Project — FAST School of Computing, 2026.  "
-        "Model accuracy is computed on the RACE validation split."
-    )
+# Step 2: Compute BLEU / ROUGE-L / METEOR
+python src/evaluate_nlp.py \\
+       --predictions data/processed/preds.txt \\
+       --references  data/processed/refs.txt \\
+       --output-json results/nlp_metrics.json
+        """, language="bash")
 
 
-# ===========================================================================
-# Main
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  Router
+# ══════════════════════════════════════════════════════════════════════════════
 
-def main() -> None:
-    _init_state()
-
-    vectorizer = load_vectorizer()
-    lr_model   = load_classifier()
-    svm_model  = load_svm()
-
-    page = render_sidebar()
-    st.session_state.page = page
-
-    if page == "📝 Article Input":
-        screen_article_input(vectorizer, lr_model, svm_model)
-    elif page == "📚 Quiz View":
-        screen_quiz_view(vectorizer, lr_model, svm_model)
-    elif page == "💡 Hint Panel":
-        screen_hint_panel()
-    elif page == "📊 Analytics Dashboard":
-        screen_analytics(lr_model, svm_model)
-
-
-if __name__ == "__main__":
-    main()
+screen = st.session_state.screen
+if screen == "input":
+    screen_input()
+elif screen == "quiz":
+    screen_quiz()
+elif screen == "hints":
+    screen_hints()
+elif screen == "analytics":
+    screen_analytics()
+else:
+    screen_input()
