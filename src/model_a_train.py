@@ -68,8 +68,12 @@ LR_PARAMS = dict(C=1.0, max_iter=1000, solver="liblinear",
 SVM_PARAMS = dict(C=0.1, max_iter=4000, random_state=42, class_weight="balanced", dual="auto")
 NB_PARAMS = dict(alpha=0.3)
 # RF on sparse 15k-feature data is expensive; keep modest defaults.
-RF_PARAMS = dict(n_estimators=80, max_depth=24, max_features="sqrt",
-                 min_samples_leaf=4, class_weight="balanced",
+# max_features=0.05 → ~750 cols/split (vs sqrt=122). With 10 lexical features,
+# this raises the probability a split-candidate set contains at least one
+# engineered feature from ~8% to ~39% — letting the strong lexical signal
+# influence a much larger fraction of nodes.
+RF_PARAMS = dict(n_estimators=150, max_depth=24, max_features=0.05,
+                 min_samples_leaf=2, class_weight="balanced",
                  random_state=42, n_jobs=-1)
 def _detect_xgb_device() -> str:
     """Return 'cuda' if XGBoost can see a GPU, else 'cpu'."""
@@ -88,10 +92,14 @@ def _detect_xgb_device() -> str:
 # XGBoost: hist + GPU when available (5-10x speedup on Colab/Kaggle).
 # Shallow trees + L2 regularisation prevent overfitting to spurious vocab terms.
 _XGB_DEVICE = _detect_xgb_device()
-XGB_PARAMS = dict(n_estimators=300, max_depth=5, tree_method="hist",
+# colsample_bytree=1.0 ensures every tree sees all 10 lexical features (with
+# only 0.6 they were sampled out of ~40% of trees, which collapsed prediction).
+# scale_pos_weight=2.5 corrects 3:1 imbalance without overshooting.
+XGB_PARAMS = dict(n_estimators=400, max_depth=6, tree_method="hist",
                   device=_XGB_DEVICE, learning_rate=0.08,
                   reg_lambda=1.0, reg_alpha=0.1, subsample=0.8,
-                  colsample_bytree=0.6, min_child_weight=8,
+                  colsample_bytree=1.0, min_child_weight=5,
+                  scale_pos_weight=2.5,
                   eval_metric="logloss", random_state=42, n_jobs=-1)
 KM_PARAMS = dict(n_clusters=4, n_init=10, random_state=42)
 LP_PARAMS = dict(kernel="knn", n_neighbors=7, max_iter=1000)
