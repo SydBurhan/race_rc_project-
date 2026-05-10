@@ -1,17 +1,27 @@
-#23i0757 23i0541 Syed Burhan Ahmad + Mushahid Hussain Project AI, Machine Learning
+"""
+src/preprocessing.py
+====================
+RACE preprocessing pipeline (traditional ML only, no neural nets).
 
-# This will be the main preproccesor for data, as files are large and may be redundant, what to do?
-# 1) Parse RACE dir, one quesrtiom, one row 
-# 2) Save files to test train val, what aboyt tts? id->art->Q->ABDC-> answer
-# 3) Vectoirzation (corpus), 
-# 4) Persist artefacts, all data that has been processed ok
-# Once done, model A can be trained :)
+Reads CSVs from data/raw/{train,val,test}.csv with columns
+[id, article, question, A, B, C, D, answer], and produces:
+
+  models/model_a/tfidf_vectorizer.joblib
+  models/model_a/traditional/ohe_vectorizer.pkl
+  data/processed/{train,val,test}.csv          (cleaned copies)
+  data/processed/X_tfidf_{train,val,test}.npz  (TF-IDF, doc-level)
+  data/processed/X_ohe_{train,val,test}.npz    (OHE, option-level expanded)
+  data/processed/X_combined_{train,val,test}.npz  (OHE + lexical, option-level)
+  data/processed/y_{train,val,test}.npy        (binary labels, option-level)
+
+Reproducibility: all random_state=42.
+No fit_transform on val/test.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
-import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -20,313 +30,260 @@ import joblib
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.feature_extraction.text import TfidfVectorizer
-#Logging details
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-#File dir struct
-RAW_DIR       = Path("data") / "raw"
-PROCESSED_DIR = Path("data") / "processed"
-MODEL_DIR     = Path("models") / "model_a"
 
-RAW_SUBDIRS: dict[str, str] = {
-    "train": "train",
-    "val":   "dev",    # is this split?
-    "test":  "test",
-}
+# ── Paths ─────────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+RAW_DIR = ROOT / "data" / "raw"
+PROCESSED_DIR = ROOT / "data" / "processed"
+MODEL_A_DIR = ROOT / "models" / "model_a"
+MODEL_A_TRAD_DIR = MODEL_A_DIR / "traditional"
 
-CSV_PATHS: dict[str, Path] = {
-    split: PROCESSED_DIR / f"{split}.csv"
-    for split in ("train", "val", "test")
-}
+TFIDF_PATH = MODEL_A_DIR / "tfidf_vectorizer.joblib"
+OHE_PATH = MODEL_A_TRAD_DIR / "ohe_vectorizer.pkl"
 
-VECTORIZER_PATH = MODEL_DIR / "tfidf_vectorizer.joblib"
-#Project specific
-TFIDF_PARAMS: dict = dict(
-    stop_words="english",
-    sublinear_tf=True,
-    max_features=15_000,
-)
+CSV_PATHS = {s: PROCESSED_DIR / f"{s}.csv" for s in ("train", "val", "test")}
 
-#Map answers sequentially
-ANSWER_MAP: dict[str, int] = {"A": 0, "B": 1, "C": 2, "D": 3}
+ANSWER_MAP = {"A": 0, "B": 1, "C": 2, "D": 3}
+OPTIONS = ["A", "B", "C", "D"]
 
-#1)
-def _parse_race_file(filepath: Path, split_name: str) -> list[dict]:
-    """
-    Parse a single RACE JSON file and return a list of row dicts, one per
-    question in that article.
-
-    RACE JSON schema
-    ----------------
-    {
-        "article":   str,
-        "questions": [str, ...],
-        "options":   [[A, B, C, D], ...],   # parallel to questions
-        "answers":   [str, ...]             # "A"|"B"|"C"|"D", may be absent
-    }
-    """
-    rows: list[dict] = []
-
-    try:
-        with filepath.open(encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning("Skipping %s — could not parse: %s", filepath, exc)
-        return rows
-
-    article   = str(data.get("article",   "")).strip()
-    questions = data.get("questions", [])
-    options   = data.get("options",   [])
-    answers   = data.get("answers",   [])   # may be empty list for test split
-
-    if not questions:
-        log.warning("No questions in %s — skipping file.", filepath)
-        return rows
-
-    for q_idx, question in enumerate(questions):
-        opts = options[q_idx] if q_idx < len(options) else ["", "", "", ""]
-
-        # exactly 4 options ABCD
-        while len(opts) < 4:
-            opts.append("")
-        opts = opts[:4]
-
-        answer = answers[q_idx] if q_idx < len(answers) else None
-
-        row = {
-            # primary key-ish, uniqueness 
-            "id":       f"{split_name}_{filepath.stem}_{q_idx}",
-            "article":  article,
-            "question": str(question).strip(),
-            "A":        str(opts[0]).strip(),
-            "B":        str(opts[1]).strip(),
-            "C":        str(opts[2]).strip(),
-            "D":        str(opts[3]).strip(),
-            "answer":   str(answer).strip() if answer is not None else None,
-        }
-        rows.append(row)
-
-    return rows
+TFIDF_PARAMS = dict(stop_words="english", sublinear_tf=True, max_features=15_000)
+OHE_PARAMS = dict(binary=True, max_features=15_000, stop_words="english")
 
 
-def parse_race_directory(split_name: str) -> pd.DataFrame:
-    # Add all files into a single DataFrame, be it high medium
-    
-    subdir_name = RAW_SUBDIRS[split_name]
-    root_dir    = RAW_DIR / subdir_name
+# ══════════════════════════════════════════════════════════════════════════════
+#  Loading & cleaning
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if not root_dir.exists():
-        log.error(
-            "Raw directory not found: %s\n"
-            "  Expected layout: data/raw/%s/**/*.txt  (or *.json)\n"
-            "  Please download the RACE dataset and place it there.",
-            root_dir, subdir_name,
-        )
+def _clean_text(text: str) -> str:
+    text = str(text).lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def load_raw_csv(split: str) -> pd.DataFrame:
+    path = RAW_DIR / f"{split}.csv"
+    if not path.exists():
+        log.error("Missing raw CSV: %s", path)
         sys.exit(1)
-
-    log.info("Scanning %s ...", root_dir)
-    all_rows: list[dict] = []
-
-    # rglob picks up both flat and nested directory structures
-    json_files = sorted(f for f in root_dir.rglob("*") if f.is_file())
-
-    if not json_files:
-        log.error("No files found under %s. Aborting.", root_dir)
+    df = pd.read_csv(path)
+    required = {"id", "article", "question", "A", "B", "C", "D", "answer"}
+    missing = required - set(df.columns)
+    if missing:
+        log.error("CSV %s missing columns: %s", path, missing)
         sys.exit(1)
-
-    for filepath in json_files:
-        rows = _parse_race_file(filepath, split_name)
-        all_rows.extend(rows)
-
-    if not all_rows:
-        log.error("Parsed 0 rows from %s. Check file format.", root_dir)
-        sys.exit(1)
-
-    df = pd.DataFrame(all_rows, columns=["id", "article", "question",
-                                          "A", "B", "C", "D", "answer"])
-    log.info(
-        "  %s -> %d files, %d question-rows  (answer coverage: %d / %d)",
-        split_name,
-        len(json_files),
-        len(df),
-        df["answer"].notna().sum(),
-        len(df),
-    )
+    df = df.dropna(subset=["article", "question", "answer"]).reset_index(drop=True)
+    df["answer"] = df["answer"].astype(str).str.strip().str.upper()
+    df = df[df["answer"].isin(OPTIONS)].reset_index(drop=True)
+    log.info("Loaded %s: %d rows", split, len(df))
     return df
 
 
- #2) 
-def save_dataframes(
-    train_df: pd.DataFrame,
-    val_df:   pd.DataFrame,
-    test_df:  pd.DataFrame,
-) -> None:
-    """Write three DataFrames to data/processed/ as UTF-8 CSVs."""
+def save_processed_csv(df: pd.DataFrame, split: str) -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(CSV_PATHS[split], index=False, encoding="utf-8")
+    log.info("Saved %s -> %s", split, CSV_PATHS[split])
 
-    for split_name, df in (("train", train_df), ("val", val_df), ("test", test_df)):
-        out_path = CSV_PATHS[split_name]
-        df.to_csv(out_path, index=False, encoding="utf-8")
-        log.info("Saved %s -> %s  (%d rows)", split_name, out_path, len(df))
 
-#3)
-def build_corpus(df: pd.DataFrame) -> pd.Series:
+# ══════════════════════════════════════════════════════════════════════════════
+#  Doc-level TF-IDF (one vector per question, used for hints/distractors)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_doc_corpus(df: pd.DataFrame) -> pd.Series:
+    a = df["article"].fillna("").astype(str).map(_clean_text)
+    q = df["question"].fillna("").astype(str).map(_clean_text)
+    A = df["A"].fillna("").astype(str).map(_clean_text)
+    B = df["B"].fillna("").astype(str).map(_clean_text)
+    C = df["C"].fillna("").astype(str).map(_clean_text)
+    D = df["D"].fillna("").astype(str).map(_clean_text)
+    return a + " " + a + " " + q + " " + A + " " + B + " " + C + " " + D
+
+
+def build_tfidf(train_df, val_df, test_df):
+    log.info("Building TF-IDF (fit on train only) ...")
+    train_corpus = _build_doc_corpus(train_df)
+    val_corpus = _build_doc_corpus(val_df)
+    test_corpus = _build_doc_corpus(test_df)
+
+    vec = TfidfVectorizer(**TFIDF_PARAMS)
+    X_tr = vec.fit_transform(train_corpus)
+    X_va = vec.transform(val_corpus)
+    X_te = vec.transform(test_corpus)
+
+    MODEL_A_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(vec, TFIDF_PATH)
+    log.info("TF-IDF vocab=%d, saved -> %s", len(vec.vocabulary_), TFIDF_PATH)
+    return X_tr, X_va, X_te, vec
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Option-level expansion: 4 rows per question (1 correct + 3 distractors)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _expand_to_options(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, r in df.iterrows():
+        article = _clean_text(r["article"])
+        question = _clean_text(r["question"])
+        correct = str(r["answer"]).strip().upper()
+        for i, opt in enumerate(OPTIONS):
+            opt_text = _clean_text(r.get(opt, ""))
+            rows.append({
+                "article": article,
+                "question": question,
+                "option_text": opt_text,
+                "option_idx": i,
+                "label": 1 if opt == correct else 0,
+            })
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  One-Hot Encoding (option-level, primary feature representation)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_ohe_features(train_df, val_df, test_df):
     """
-    Combine article (repeated), question, and all four options into a
-    single string per row.
-
-    Formula (TF-IDF Manual section 6 — common-mistake table):
-        combined = article + article + question + A + B + C + D
-
-    Repeating the article gives passage content more influence over IDF
-    weights than the shorter option strings.
+    Fit a binary CountVectorizer on training option-level rows, transform all splits.
+    Returns (X_train, X_val, X_test, expanded_dfs_dict, fitted_vectorizer).
     """
-    article  = df["article"].fillna("").astype(str)
-    question = df["question"].fillna("").astype(str)
-    a = df["A"].fillna("").astype(str)
-    b = df["B"].fillna("").astype(str)
-    c = df["C"].fillna("").astype(str)
-    d = df["D"].fillna("").astype(str)
+    log.info("Building One-Hot Encoding features (option-level) ...")
+    expanded = {
+        "train": _expand_to_options(train_df),
+        "val": _expand_to_options(val_df),
+        "test": _expand_to_options(test_df),
+    }
 
-    return (
-        article + " " + article + " "
-        + question + " "
-        + a + " " + b + " " + c + " " + d
-    )
+    def _combined(df):
+        return (df["article"] + " " + df["question"] + " " + df["option_text"]).tolist()
 
+    vec = CountVectorizer(**OHE_PARAMS)
+    X_tr = vec.fit_transform(_combined(expanded["train"]))
+    X_va = vec.transform(_combined(expanded["val"]))
+    X_te = vec.transform(_combined(expanded["test"]))
 
-def extract_labels(df: pd.DataFrame, split_name: str) -> Optional[np.ndarray]:
-    """Convert A/B/C/D answer strings to integer labels 0-3."""
-    if "answer" not in df.columns or df["answer"].isna().all():
-        log.warning(
-            "Split '%s' has no answer labels — skipping label extraction.",
-            split_name,
-        )
-        return None
-
-    labels = df["answer"].map(ANSWER_MAP)
-
-    unmapped = df.loc[labels.isna(), "answer"].dropna().unique()
-    if len(unmapped):
-        log.warning("Unmapped answer values in '%s': %s", split_name, unmapped)
-
-    return labels.to_numpy()
+    MODEL_A_TRAD_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(vec, OHE_PATH)
+    log.info("OHE vocab=%d, saved -> %s", len(vec.vocabulary_), OHE_PATH)
+    log.info("OHE shapes train=%s val=%s test=%s", X_tr.shape, X_va.shape, X_te.shape)
+    return X_tr, X_va, X_te, expanded, vec
 
 
-def vectorise(
-    train_df: pd.DataFrame,
-    val_df:   pd.DataFrame,
-    test_df:  pd.DataFrame,
-) -> tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix, TfidfVectorizer]:
-   
-    log.info("Building text corpora ...")
-    train_corpus = build_corpus(train_df)
-    val_corpus   = build_corpus(val_df)
-    test_corpus  = build_corpus(test_df)
+# ══════════════════════════════════════════════════════════════════════════════
+#  Handcrafted lexical features (option-level)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    log.info("  Train: %d documents", len(train_corpus))
-    log.info("  Val  : %d documents", len(val_corpus))
-    log.info("  Test : %d documents", len(test_corpus))
-
-    log.info("Initialising TfidfVectorizer  params=%s", TFIDF_PARAMS)
-    vectorizer = TfidfVectorizer(**TFIDF_PARAMS)
-
-    # FIT on training data only 
-    log.info("fit_transform() on training corpus ...")
-    X_train: sp.csr_matrix = vectorizer.fit_transform(train_corpus)
-
-    # TRANSFORM val & test  NO refitting 
-    log.info("transform() on validation corpus (no refitting) ...")
-    X_val:  sp.csr_matrix = vectorizer.transform(val_corpus)
-
-    log.info("transform() on test corpus (no refitting) ...")
-    X_test: sp.csr_matrix = vectorizer.transform(test_corpus)
-
-    log.info(
-        "Vocabulary size : %d  (max_features=%d)",
-        len(vectorizer.vocabulary_),
-        TFIDF_PARAMS["max_features"],
-    )
-    log.info(
-        "Matrix shapes   : train=%s  val=%s  test=%s",
-        X_train.shape, X_val.shape, X_test.shape,
-    )
-
-    return X_train, X_val, X_test, vectorizer
+def build_lexical_features(expanded_df: pd.DataFrame) -> np.ndarray:
+    """
+    Returns a (n_rows, 6) dense float array:
+       article_len, question_len, option_len,
+       keyword_overlap, answer_in_article, option_position
+    """
+    feats = np.zeros((len(expanded_df), 6), dtype=np.float32)
+    for i, r in enumerate(expanded_df.itertuples(index=False)):
+        a_words = str(r.article).split()
+        q_words = str(r.question).split()
+        o_words = str(r.option_text).split()
+        a_set = set(a_words)
+        feats[i, 0] = len(a_words)
+        feats[i, 1] = len(q_words)
+        feats[i, 2] = len(o_words)
+        feats[i, 3] = sum(1 for w in o_words if w in a_set)
+        feats[i, 4] = 1.0 if str(r.option_text) and str(r.option_text) in str(r.article) else 0.0
+        feats[i, 5] = float(r.option_idx)
+    return feats
 
 
-#4)
-def save_artefacts(
-    vectorizer: TfidfVectorizer,
-    X_train: sp.csr_matrix,
-    X_val:   sp.csr_matrix,
-    X_test:  sp.csr_matrix,
-    y_train: Optional[np.ndarray],
-    y_val:   Optional[np.ndarray],
-    y_test:  Optional[np.ndarray],
-) -> None:
-   
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    
-    joblib.dump(vectorizer, VECTORIZER_PATH)
-    log.info("Vectorizer saved -> %s", VECTORIZER_PATH)
-
-    for name, mat in (("X_train", X_train), ("X_val", X_val), ("X_test", X_test)):
-        out = PROCESSED_DIR / f"{name}.npz"
-        sp.save_npz(str(out), mat)
-        log.info("Saved %s -> %s", name, out)
-
-    for name, arr in (("y_train", y_train), ("y_val", y_val), ("y_test", y_test)):
-        if arr is not None:
-            out = PROCESSED_DIR / f"{name}.npy"
-            np.save(str(out), arr)
-            log.info("Saved %s -> %s  (shape %s)", name, out, arr.shape)
+def combine_features(ohe_matrix: sp.csr_matrix, lexical_matrix: np.ndarray) -> sp.csr_matrix:
+    """Horizontally stack sparse OHE matrix with sparse lexical matrix."""
+    lex_sparse = sp.csr_matrix(lexical_matrix.astype(np.float32))
+    return sp.hstack([ohe_matrix, lex_sparse], format="csr")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Persistence helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
-#Running pipeline
+def save_split_artefacts(split: str, X_tfidf, X_ohe, X_combined, y) -> None:
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    sp.save_npz(PROCESSED_DIR / f"X_tfidf_{split}.npz", X_tfidf)
+    sp.save_npz(PROCESSED_DIR / f"X_ohe_{split}.npz", X_ohe)
+    sp.save_npz(PROCESSED_DIR / f"X_combined_{split}.npz", X_combined)
+    np.save(PROCESSED_DIR / f"y_{split}.npy", y)
+    log.info("Saved %s artefacts (tfidf=%s ohe=%s combined=%s y=%d)",
+             split, X_tfidf.shape, X_ohe.shape, X_combined.shape, len(y))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
 def run_preprocessing() -> None:
     log.info("=" * 65)
-    log.info("RACE Preprocessing Pipeline  (AL2002 Lab Project)")
+    log.info("RACE Preprocessing Pipeline")
     log.info("=" * 65)
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_A_DIR.mkdir(parents=True, exist_ok=True)
+    MODEL_A_TRAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    
-    log.info("[Stage 1] Parsing raw RACE directories ...")
-    train_df = parse_race_directory("train")
-    val_df   = parse_race_directory("val")
-    test_df  = parse_race_directory("test")
+    # 1. Load raw CSVs
+    train_df = load_raw_csv("train")
+    val_df = load_raw_csv("val")
+    test_df = load_raw_csv("test")
 
-    
-    log.info("[Stage 2] Saving DataFrames as CSVs ...")
-    save_dataframes(train_df, val_df, test_df)
+    # 2. Persist cleaned doc-level CSVs (for downstream model_b/template_generator)
+    for split, df in (("train", train_df), ("val", val_df), ("test", test_df)):
+        save_processed_csv(df, split)
 
-    
-    log.info("[Stage 3] TF-IDF vectorisation ...")
-    X_train, X_val, X_test, vectorizer = vectorise(train_df, val_df, test_df)
+    # 3. Doc-level TF-IDF (for distractor / hint cosine similarity)
+    X_tfidf_tr, X_tfidf_va, X_tfidf_te, _ = build_tfidf(train_df, val_df, test_df)
 
-    y_train = extract_labels(train_df, "train")
-    y_val   = extract_labels(val_df,   "val")
-    y_test  = extract_labels(test_df,  "test")
+    # 4. Option-level OHE (for verifier / classifiers)
+    X_ohe_tr, X_ohe_va, X_ohe_te, expanded, _ = build_ohe_features(train_df, val_df, test_df)
 
-   
-    log.info("[Stage 4] Saving artefacts ...")
-    save_artefacts(vectorizer, X_train, X_val, X_test, y_train, y_val, y_test)
+    # 5. Handcrafted lexical features (option-level) + combined matrix
+    log.info("Building lexical features ...")
+    lex_tr = build_lexical_features(expanded["train"])
+    lex_va = build_lexical_features(expanded["val"])
+    lex_te = build_lexical_features(expanded["test"])
+
+    X_comb_tr = combine_features(X_ohe_tr, lex_tr)
+    X_comb_va = combine_features(X_ohe_va, lex_va)
+    X_comb_te = combine_features(X_ohe_te, lex_te)
+
+    y_tr = expanded["train"]["label"].to_numpy(dtype=np.int8)
+    y_va = expanded["val"]["label"].to_numpy(dtype=np.int8)
+    y_te = expanded["test"]["label"].to_numpy(dtype=np.int8)
+
+    # 6. Per-split TF-IDF aligned at option-level (each doc-row repeated 4 times)
+    X_tfidf_tr_opt = _row_repeat(X_tfidf_tr, 4)
+    X_tfidf_va_opt = _row_repeat(X_tfidf_va, 4)
+    X_tfidf_te_opt = _row_repeat(X_tfidf_te, 4)
+
+    save_split_artefacts("train", X_tfidf_tr_opt, X_ohe_tr, X_comb_tr, y_tr)
+    save_split_artefacts("val",   X_tfidf_va_opt, X_ohe_va, X_comb_va, y_va)
+    save_split_artefacts("test",  X_tfidf_te_opt, X_ohe_te, X_comb_te, y_te)
 
     log.info("=" * 65)
-    log.info("Preprocessing complete.  All artefacts written to:")
-    log.info("  CSVs       -> %s/", PROCESSED_DIR)
-    log.info("  Vectorizer -> %s",  VECTORIZER_PATH)
+    log.info("Preprocessing complete. Artefacts under data/processed/ and models/model_a/")
     log.info("=" * 65)
 
+
+def _row_repeat(X: sp.csr_matrix, k: int) -> sp.csr_matrix:
+    """Repeat each row of sparse matrix k times (alignment with option-level rows)."""
+    if X.shape[0] == 0:
+        return sp.csr_matrix((0, X.shape[1]))
+    idx = np.repeat(np.arange(X.shape[0]), k)
+    return X[idx]
 
 
 if __name__ == "__main__":

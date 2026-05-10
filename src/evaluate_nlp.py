@@ -1,26 +1,12 @@
 """
 src/evaluate_nlp.py
 ===================
-NLP Evaluation Module — BLEU · ROUGE-L · METEOR
-================================================
-Per professor's override:
-  "Since your model is performing a text generation task, the appropriate
-   evaluation metrics are BLEU, ROUGE, and METEOR.
-   Do NOT use Accuracy or Precision."
+NLP evaluation — BLEU / ROUGE-L / METEOR for Model A (questions) and
+Model B (distractors + hints).
 
-Libraries used:
-  • nltk        — BLEU (corpus_bleu) and METEOR (meteor_score)
-  • rouge-score — ROUGE-L (RougeScorer)
-
-Evaluation target:
-  • Model A outputs (generated questions) are scored against the
-    reference questions from the RACE dataset test split.
-
-Usage (CLI):
-    python src/evaluate_nlp.py --predictions preds.txt --references refs.txt
-
-Usage (Python import):
-    from src.evaluate_nlp import evaluate_generation, score_single
+CLI:
+    python src/evaluate_nlp.py                  # full corpus run on test split
+    python src/evaluate_nlp.py --max 500        # limit to first 500 rows
 """
 
 from __future__ import annotations
@@ -28,294 +14,240 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-from typing import Optional
+import sys
+from pathlib import Path
 
 import nltk
-from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
+import pandas as pd
+from nltk.translate.bleu_score import SmoothingFunction, corpus_bleu
 from nltk.translate.meteor_score import meteor_score
 from rouge_score import rouge_scorer
 
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-# ── NLTK data bootstrap ────────────────────────────────────────────────────────
-_NLTK_PACKAGES = ["wordnet", "punkt", "punkt_tab", "omw-1.4"]
+ROOT = Path(__file__).resolve().parents[1]
+PROCESSED_DIR = ROOT / "data" / "processed"
+REPORTS_DIR = ROOT / "reports"
+METRICS_PATH = REPORTS_DIR / "metrics_test.json"
 
-def _ensure_nltk_data() -> None:
-    """Download required NLTK corpora if not already present."""
-    for pkg in _NLTK_PACKAGES:
+# ── NLTK bootstrap ────────────────────────────────────────────────────────────
+for _pkg in ("wordnet", "punkt", "punkt_tab", "omw-1.4"):
+    try:
+        nltk.data.find(f"corpora/{_pkg}")
+    except LookupError:
         try:
-            nltk.data.find(f"tokenizers/{pkg}")
+            nltk.data.find(f"tokenizers/{_pkg}")
         except LookupError:
             try:
-                nltk.data.find(f"corpora/{pkg}")
-            except LookupError:
-                logger.info(f"[evaluate_nlp] Downloading NLTK package: {pkg}")
-                nltk.download(pkg, quiet=True)
+                nltk.download(_pkg, quiet=True)
+            except Exception:
+                pass
 
-_ensure_nltk_data()
-
-# ── ROUGE scorer (reusable instance) ──────────────────────────────────────────
 _rouge = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-
-# ── Smoothing function for BLEU (avoids zero scores on short sequences) ────────
 _smoother = SmoothingFunction().method1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Core scoring functions
+#  Core metric functions
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_bleu(hypotheses: list[str], references: list[str]) -> dict[str, float]:
-    """
-    Compute corpus-level BLEU-1 through BLEU-4.
+def _tok(s: str) -> list[str]:
+    try:
+        return nltk.word_tokenize(str(s).lower())
+    except LookupError:
+        return str(s).lower().split()
 
-    Args:
-        hypotheses: List of generated strings (one per sample).
-        references: List of reference strings (one per sample, same order).
 
-    Returns:
-        {"bleu_1": float, "bleu_2": float, "bleu_3": float, "bleu_4": float}
-    """
-    tokenised_hyps = [nltk.word_tokenize(h.lower()) for h in hypotheses]
-    tokenised_refs = [[nltk.word_tokenize(r.lower())] for r in references]
-
-    bleu_scores = {}
+def compute_bleu(hyps: list[str], refs: list[str]) -> dict:
+    th = [_tok(h) for h in hyps]
+    tr = [[_tok(r)] for r in refs]
+    out = {}
     for n in range(1, 5):
         weights = tuple(1.0 / n if i < n else 0.0 for i in range(4))
-        bleu_scores[f"bleu_{n}"] = round(
-            corpus_bleu(tokenised_refs, tokenised_hyps,
-                        weights=weights,
-                        smoothing_function=_smoother),
-            4,
+        out[f"bleu_{n}"] = round(
+            corpus_bleu(tr, th, weights=weights, smoothing_function=_smoother), 4
         )
-    return bleu_scores
+    return out
 
 
-def compute_rouge_l(hypotheses: list[str], references: list[str]) -> dict[str, float]:
-    """
-    Compute macro-averaged ROUGE-L precision, recall, and F1.
-
-    Args:
-        hypotheses: Generated strings.
-        references: Reference strings.
-
-    Returns:
-        {"rouge_l_precision": float, "rouge_l_recall": float, "rouge_l_f1": float}
-    """
-    p_scores, r_scores, f_scores = [], [], []
-
-    for hyp, ref in zip(hypotheses, references):
-        scores = _rouge.score(ref, hyp)
-        p_scores.append(scores["rougeL"].precision)
-        r_scores.append(scores["rougeL"].recall)
-        f_scores.append(scores["rougeL"].fmeasure)
-
-    n = max(len(hypotheses), 1)
+def compute_rouge_l(hyps: list[str], refs: list[str]) -> dict:
+    p, r, f = [], [], []
+    for h, ref in zip(hyps, refs):
+        s = _rouge.score(str(ref), str(h))["rougeL"]
+        p.append(s.precision); r.append(s.recall); f.append(s.fmeasure)
+    n = max(len(hyps), 1)
     return {
-        "rouge_l_precision": round(sum(p_scores) / n, 4),
-        "rouge_l_recall":    round(sum(r_scores) / n, 4),
-        "rouge_l_f1":        round(sum(f_scores) / n, 4),
+        "rouge_l_precision": round(sum(p) / n, 4),
+        "rouge_l_recall":    round(sum(r) / n, 4),
+        "rouge_l_f1":        round(sum(f) / n, 4),
     }
 
 
-def compute_meteor(hypotheses: list[str], references: list[str]) -> dict[str, float]:
-    """
-    Compute macro-averaged METEOR score.
-
-    NLTK's meteor_score takes tokenised lists.
-
-    Args:
-        hypotheses: Generated strings.
-        references: Reference strings.
-
-    Returns:
-        {"meteor": float}
-    """
+def compute_meteor(hyps: list[str], refs: list[str]) -> dict:
     scores = []
-    for hyp, ref in zip(hypotheses, references):
-        hyp_tok = nltk.word_tokenize(hyp.lower())
-        ref_tok = nltk.word_tokenize(ref.lower())
-        # meteor_score expects (list_of_references, hypothesis) — both tokenised
-        scores.append(meteor_score([ref_tok], hyp_tok))
-
-    avg = round(sum(scores) / max(len(scores), 1), 4)
-    return {"meteor": avg}
+    for h, ref in zip(hyps, refs):
+        scores.append(meteor_score([_tok(ref)], _tok(h)))
+    return {"meteor": round(sum(scores) / max(len(scores), 1), 4)}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  High-level evaluation entry points
-# ══════════════════════════════════════════════════════════════════════════════
-
-def evaluate_generation(
-    hypotheses: list[str],
-    references: list[str],
-    verbose: bool = True,
-) -> dict[str, float]:
-    """
-    Run all three metrics (BLEU, ROUGE-L, METEOR) on a batch of predictions.
-
-    Args:
-        hypotheses: Model A generated questions.
-        references: Corresponding RACE reference questions.
-        verbose   : If True, pretty-print results to stdout.
-
-    Returns:
-        Flat dict with all metric values, e.g.:
-        {
-          "bleu_1": 0.42, "bleu_2": 0.31, "bleu_3": 0.22, "bleu_4": 0.16,
-          "rouge_l_precision": 0.38, "rouge_l_recall": 0.41, "rouge_l_f1": 0.39,
-          "meteor": 0.34,
-          "num_samples": 100
-        }
-    """
-    assert len(hypotheses) == len(references), (
-        f"Mismatch: {len(hypotheses)} hypotheses vs {len(references)} references."
-    )
-
-    results: dict[str, float] = {}
-    results.update(compute_bleu(hypotheses, references))
-    results.update(compute_rouge_l(hypotheses, references))
-    results.update(compute_meteor(hypotheses, references))
-    results["num_samples"] = len(hypotheses)
-
+def evaluate_generation(hyps: list[str], refs: list[str], verbose=True) -> dict:
+    assert len(hyps) == len(refs), f"size mismatch: {len(hyps)} vs {len(refs)}"
+    out: dict = {}
+    out.update(compute_bleu(hyps, refs))
+    out.update(compute_rouge_l(hyps, refs))
+    out.update(compute_meteor(hyps, refs))
+    out["num_samples"] = len(hyps)
     if verbose:
-        _pretty_print(results)
-
-    return results
-
-
-def score_single(hypothesis: str, reference: str) -> dict[str, float]:
-    """
-    Score a *single* hypothesis / reference pair.
-    Useful for real-time per-inference scoring in the Streamlit UI.
-
-    Returns:
-        {"bleu_1", "bleu_2", "bleu_3", "bleu_4",
-         "rouge_l_precision", "rouge_l_recall", "rouge_l_f1",
-         "meteor"}
-    """
-    return evaluate_generation([hypothesis], [reference], verbose=False)
+        _print_table("Generation Metrics", out)
+    return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  RACE dataset evaluation helper
-# ══════════════════════════════════════════════════════════════════════════════
+def score_single(hyp: str, ref: str) -> dict:
+    return evaluate_generation([hyp], [ref], verbose=False)
 
-def evaluate_on_race(
-    generator,                   # FlanT5Generator instance
-    race_samples: list[dict],    # List of {"article", "question"} dicts
-    max_samples: Optional[int] = 100,
-    output_json: Optional[str]  = None,
-) -> dict[str, float]:
-    """
-    Run Model A over `max_samples` RACE examples and compute all NLP metrics.
 
-    Args:
-        generator   : Instantiated FlanT5Generator.
-        race_samples: List of dicts with at least {"article", "question"} keys.
-        max_samples : Cap on number of samples to evaluate (None = all).
-        output_json : If provided, save per-sample results to this path.
+def _print_table(title: str, d: dict) -> None:
+    print(f"\n{'─' * 50}\n  {title}\n{'─' * 50}")
+    for k in ("bleu_1", "bleu_2", "bleu_3", "bleu_4",
+              "rouge_l_precision", "rouge_l_recall", "rouge_l_f1", "meteor",
+              "num_samples"):
+        if k in d:
+            v = d[k]
+            print(f"  {k:<22} : {v}")
+    print("─" * 50)
 
-    Returns:
-        Aggregate metrics dict from evaluate_generation().
-    """
-    samples = race_samples[:max_samples] if max_samples else race_samples
-    hypotheses, references, per_sample = [], [], []
 
-    logger.info(f"[evaluate_nlp] Evaluating on {len(samples)} RACE samples …")
-
-    for i, sample in enumerate(samples):
-        passage   = sample["article"]
-        reference = sample["question"]
-
-        result    = generator.run_pipeline(passage)
-        hypothesis = result["question"]
-
-        hypotheses.append(hypothesis)
-        references.append(reference)
-
-        per_sample.append({
-            "index":      i,
-            "passage":    passage[:200] + "…",
-            "reference":  reference,
-            "hypothesis": hypothesis,
-            "latency":    result["latency_sec"],
-        })
-
-        if (i + 1) % 10 == 0:
-            logger.info(f"  … {i + 1}/{len(samples)} done")
-
-    metrics = evaluate_generation(hypotheses, references, verbose=True)
-
-    if output_json:
-        os.makedirs(os.path.dirname(output_json), exist_ok=True)
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump({"metrics": metrics, "samples": per_sample}, f, indent=2)
-        logger.info(f"[evaluate_nlp] Results saved → {output_json}")
-
-    return metrics
+def save_metrics_json(metrics: dict, path: Path = METRICS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metrics, indent=2))
+    log.info("Metrics saved -> %s", path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Pretty printer
+#  Corpus-level evaluation runner
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _pretty_print(metrics: dict) -> None:
-    divider = "─" * 42
-    print(f"\n{divider}")
-    print("  Model A — NLP Evaluation Results")
-    print(divider)
-    print(f"  Samples evaluated : {metrics.get('num_samples', '—')}")
-    print(divider)
-    print(f"  BLEU-1  : {metrics.get('bleu_1',  0):.4f}")
-    print(f"  BLEU-2  : {metrics.get('bleu_2',  0):.4f}")
-    print(f"  BLEU-3  : {metrics.get('bleu_3',  0):.4f}")
-    print(f"  BLEU-4  : {metrics.get('bleu_4',  0):.4f}")
-    print(divider)
-    print(f"  ROUGE-L P : {metrics.get('rouge_l_precision', 0):.4f}")
-    print(f"  ROUGE-L R : {metrics.get('rouge_l_recall',    0):.4f}")
-    print(f"  ROUGE-L F1: {metrics.get('rouge_l_f1',        0):.4f}")
-    print(divider)
-    print(f"  METEOR  : {metrics.get('meteor', 0):.4f}")
-    print(divider + "\n")
+def run_full_evaluation(
+    model_a_predictions: list[str],
+    model_b_distractor_predictions: list[list[str]],
+    model_b_hint_predictions: list[str],
+    references_a: list[str],
+    references_b_dist: list[list[str]],
+    references_b_hint: list[str],
+) -> dict:
+    log.info("=" * 60)
+    log.info("Running full NLP evaluation")
+    log.info("=" * 60)
+
+    out: dict = {}
+
+    # Model A — questions
+    out["model_a"] = evaluate_generation(model_a_predictions, references_a)
+
+    # Model B — distractors: flatten each row's 3 generated distractors against
+    # the 3 ground-truth wrong options (positional pairing).
+    flat_h, flat_r = [], []
+    for hyps3, refs3 in zip(model_b_distractor_predictions, references_b_dist):
+        for i in range(min(3, len(hyps3), len(refs3))):
+            flat_h.append(str(hyps3[i]))
+            flat_r.append(str(refs3[i]))
+    if flat_h:
+        out["model_b_distractors"] = evaluate_generation(flat_h, flat_r)
+    else:
+        out["model_b_distractors"] = {"num_samples": 0}
+
+    # Model B — hints (top-1 hint per sample vs gold answer sentence)
+    if model_b_hint_predictions:
+        out["model_b_hints"] = evaluate_generation(
+            model_b_hint_predictions, references_b_hint
+        )
+    else:
+        out["model_b_hints"] = {"num_samples": 0}
+
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CLI entry point
+#  Main: run inference on test split and save metrics
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Evaluate generated questions with BLEU, ROUGE-L, METEOR."
+def _gold_answer_sentence(article: str, answer_text: str) -> str:
+    """Pick the article sentence that best contains the answer text."""
+    import re as _re
+    sents = [s.strip() for s in _re.split(r"(?<=[.!?])\s+", str(article)) if s.strip()]
+    ans_lc = str(answer_text).lower()
+    for s in sents:
+        if ans_lc and ans_lc in s.lower():
+            return s
+    return sents[0] if sents else ""
+
+
+def main(max_samples: int = 500) -> None:
+    test_csv = PROCESSED_DIR / "test.csv"
+    if not test_csv.exists():
+        log.error("Test CSV not found: %s. Run preprocessing.py first.", test_csv)
+        sys.exit(1)
+    df = pd.read_csv(test_csv).head(max_samples).reset_index(drop=True)
+    log.info("Evaluating on %d test samples", len(df))
+
+    # Local import to avoid circular dependency at module load
+    from src.inference import (
+        generate_question, generate_distractors, generate_hints,
     )
-    p.add_argument(
-        "--predictions", required=True,
-        help="Path to a text file with one generated question per line."
+
+    OPTIONS = ["A", "B", "C", "D"]
+    model_a_preds, refs_a = [], []
+    model_b_dist_preds, refs_b_dist = [], []
+    model_b_hint_preds, refs_b_hint = [], []
+
+    for i, row in df.iterrows():
+        article = str(row.get("article", "")).strip()
+        question_real = str(row.get("question", "")).strip()
+        correct_label = str(row.get("answer", "A")).strip().upper()
+        answer_text = str(row.get(correct_label, "")).strip()
+        gt_distractors = [str(row.get(o, "")) for o in OPTIONS if o != correct_label]
+        if not article or not answer_text:
+            continue
+
+        try:
+            gen_q = generate_question(article, answer_text)
+            gen_d = generate_distractors(article, gen_q, answer_text)
+            gen_h = generate_hints(article, gen_q, answer_text)
+        except Exception as e:
+            log.warning("row %d failed: %s", i, e)
+            continue
+
+        model_a_preds.append(gen_q)
+        refs_a.append(question_real)
+
+        model_b_dist_preds.append(gen_d)
+        refs_b_dist.append(gt_distractors)
+
+        model_b_hint_preds.append(gen_h[0] if gen_h else "")
+        refs_b_hint.append(_gold_answer_sentence(article, answer_text))
+
+        if (i + 1) % 50 == 0:
+            log.info("  processed %d / %d", i + 1, len(df))
+
+    metrics = run_full_evaluation(
+        model_a_predictions=model_a_preds,
+        model_b_distractor_predictions=model_b_dist_preds,
+        model_b_hint_predictions=model_b_hint_preds,
+        references_a=refs_a,
+        references_b_dist=refs_b_dist,
+        references_b_hint=refs_b_hint,
     )
-    p.add_argument(
-        "--references", required=True,
-        help="Path to a text file with one reference question per line."
-    )
-    p.add_argument(
-        "--output-json", default=None,
-        help="Optional path to save results as JSON."
-    )
-    return p
+    save_metrics_json(metrics, METRICS_PATH)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    args = _build_parser().parse_args()
-
-    with open(args.predictions, encoding="utf-8") as f:
-        hyps = [line.strip() for line in f if line.strip()]
-    with open(args.references, encoding="utf-8") as f:
-        refs = [line.strip() for line in f if line.strip()]
-
-    metrics = evaluate_generation(hyps, refs, verbose=True)
-
-    if args.output_json:
-        with open(args.output_json, "w") as f:
-            json.dump(metrics, f, indent=2)
-        print(f"Results saved → {args.output_json}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max", type=int, default=500,
+                        help="Max test rows to evaluate.")
+    args = parser.parse_args()
+    main(max_samples=args.max)

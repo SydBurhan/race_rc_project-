@@ -1,261 +1,223 @@
 """
 ui/app.py
 =========
-Streamlit UI — Intelligent Reading Comprehension & Quiz Generation System
-AL2002 Lab Project · FAST-NUCES Islamabad · Spring 2026
-
-4 Screens:
-  1. Article Input          — paste / upload / load RACE sample
-  2. Question & Answer Quiz — generated Q, 4 options (correct + 3 distractors)
-  3. Hint Panel             — graduated hints from Model B (TF-IDF)
-  4. Analytics Dashboard    — NLP metrics (BLEU/ROUGE/METEOR) + Model B stats
-
-Architecture enforced:
-  Model A → FlanT5Generator   (Generative AI, HuggingFace Transformers)
-  Model B → Classical ML only (TF-IDF + cosine similarity + MMR, no spaCy/DL)
+Streamlit UI — RACE Reading Comprehension & Quiz Generation System.
+Traditional ML only (no neural networks).
 """
 
 from __future__ import annotations
 
-import sys
+import json
 import os
-import re
-import time
-import logging
 import random
-from typing import Optional
+import sys
+import time
+from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import streamlit as st
 
-# ── Path setup so src/ modules resolve ────────────────────────────────────────
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# ── Path bootstrap so `src.*` resolves ────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.model_a_generator import FlanT5Generator, clean_passage
-from src.model_a_train    import ModelAVerifier             # Traditional ML verifier
-from src.model_b_distractor import ModelBPipeline          # Classical ML
-from src.evaluate_nlp import score_single
+from src.inference import (
+    predict_answer,
+    generate_question,
+    generate_distractors,
+    generate_hints,
+)
 
-logging.basicConfig(level=logging.WARNING)
+PROCESSED_DIR = ROOT / "data" / "processed"
+REPORTS_DIR = ROOT / "reports"
+METRICS_PATH = REPORTS_DIR / "metrics_test.json"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Page config — must be first Streamlit call
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="RC Quiz System — AL2002",
+    page_title="RACE RC Quiz System",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CSS — light polish
-# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-    .stButton > button { border-radius: 8px; font-weight: 600; }
-    .metric-card {
-        background: #f0f4ff; border-radius: 10px; padding: 1rem;
-        margin-bottom: 0.5rem; border-left: 4px solid #4f46e5;
-    }
-    .correct-badge  { color: #16a34a; font-weight: 700; font-size: 1.1rem; }
-    .wrong-badge    { color: #dc2626; font-weight: 700; font-size: 1.1rem; }
-    .hint-box {
-        background: #fffbeb; border-left: 4px solid #f59e0b;
-        padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 0.5rem;
-    }
-    .ai-badge {
-        background: #e0e7ff; color: #3730a3; font-size: 0.75rem;
-        padding: 2px 8px; border-radius: 12px; font-weight: 600;
-    }
+.stButton > button { border-radius: 8px; font-weight: 600; }
+.correct-badge  { color: #16a34a; font-weight: 700; font-size: 1.1rem; }
+.wrong-badge    { color: #dc2626; font-weight: 700; font-size: 1.1rem; }
+.hint-box {
+    background: #fffbeb; border-left: 4px solid #f59e0b;
+    padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 0.5rem;
+}
+.ai-badge {
+    background: #e0e7ff; color: #3730a3; font-size: 0.75rem;
+    padding: 2px 8px; border-radius: 12px; font-weight: 600;
+}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Cached model loaders (loaded once per session)
+#  Cached loaders
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner="Loading Flan-T5 model (Model A) …")
-def load_model_a() -> FlanT5Generator:
-    return FlanT5Generator()
-
-
-@st.cache_resource(show_spinner="Loading Model A verifier (Traditional ML) …")
-def load_verifier() -> ModelAVerifier | None:
-    """Load the traditional ML ensemble verifier. Returns None gracefully if
-    models haven't been trained yet (run model_a_train.py first)."""
-    try:
-        return ModelAVerifier.load()
-    except SystemExit:
-        return None
-
-
-@st.cache_resource(show_spinner="Initialising Model B (Classical ML) …")
-def load_model_b() -> ModelBPipeline:
-    return ModelBPipeline()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  RACE sample loader (uses HuggingFace datasets)
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(show_spinner="Fetching RACE dataset …")
-def load_race_samples(split: str = "test", n: int = 200) -> list[dict]:
-    """Return up to n samples from RACE (high school difficulty)."""
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("race", "high", split=split, trust_remote_code=True)
-        idxs = random.sample(range(len(ds)), min(n, len(ds)))
-        return [{"article": ds[i]["article"], "question": ds[i]["question"],
-                 "answer": ds[i]["answer"],
-                 "A": ds[i]["options"][0], "B": ds[i]["options"][1],
-                 "C": ds[i]["options"][2], "D": ds[i]["options"][3]}
-                for i in idxs]
-    except Exception as e:
-        st.warning(f"Could not load RACE dataset: {e}")
+@st.cache_data(show_spinner="Loading RACE test samples …")
+def load_race_samples(n: int = 200) -> list[dict]:
+    """Load test samples from local processed CSV."""
+    csv = PROCESSED_DIR / "test.csv"
+    if not csv.exists():
         return []
+    df = pd.read_csv(csv).head(n)
+    out = []
+    for _, r in df.iterrows():
+        out.append({
+            "article": r.get("article", ""),
+            "question": r.get("question", ""),
+            "answer": str(r.get("answer", "A")).upper(),
+            "A": r.get("A", ""), "B": r.get("B", ""),
+            "C": r.get("C", ""), "D": r.get("D", ""),
+        })
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_test_metrics() -> dict | None:
+    if METRICS_PATH.exists():
+        try:
+            return json.loads(METRICS_PATH.read_text())
+        except Exception:
+            return None
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Session-state initialisation
+#  Session state
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _init_state():
     defaults = {
-        "screen":           "input",        # input | quiz | hints | analytics
-        "passage":          "",
-        "pipeline_result":  None,           # output of Model A + B
-        "user_choice":      None,           # A / B / C / D
-        "answer_checked":   False,
-        "hints_revealed":   0,              # 0–3
-        "session_log":      [],             # list of per-inference dicts
-        "race_samples":     [],
-        "current_sample":   None,           # RACE sample dict for current passage (or None)
+        "screen": "input",
+        "passage": "",
+        "pipeline_result": None,
+        "user_choice": None,
+        "answer_checked": False,
+        "hints_revealed": 0,
+        "session_log": [],
+        "race_samples": [],
+        "current_sample": None,
+        "verifier_log": [],
+        "latency_log": [],
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
+
 _init_state()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Sidebar navigation
+#  Sidebar
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("📚 RC Quiz System")
-    st.caption("AL2002 · FAST-NUCES Islamabad")
+    st.title("📚 RACE RC Quiz System")
+    st.caption("Traditional ML pipeline (no neural networks)")
     st.divider()
-
     nav = st.radio(
         "Navigation",
         ["🏠 Article Input", "❓ Quiz View", "💡 Hint Panel", "📊 Analytics"],
         index=["input", "quiz", "hints", "analytics"].index(st.session_state.screen)
-              if st.session_state.screen in ["input", "quiz", "hints", "analytics"]
-              else 0,
+              if st.session_state.screen in ["input", "quiz", "hints", "analytics"] else 0,
     )
-    screen_map = {
-        "🏠 Article Input": "input",
-        "❓ Quiz View":     "quiz",
-        "💡 Hint Panel":    "hints",
-        "📊 Analytics":     "analytics",
-    }
+    screen_map = {"🏠 Article Input": "input", "❓ Quiz View": "quiz",
+                  "💡 Hint Panel": "hints", "📊 Analytics": "analytics"}
     st.session_state.screen = screen_map[nav]
-
     st.divider()
-    st.markdown('<span class="ai-badge">⚠️ AI-Generated Content</span>', unsafe_allow_html=True)
-    st.caption("Questions & answers are AI-generated and may contain errors. Not for real exam use.")
+    st.markdown('<span class="ai-badge">⚠️ AI-Generated Content</span>',
+                unsafe_allow_html=True)
+    st.caption("Questions and distractors are auto-generated by traditional ML; verify before use.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helper — run full pipeline
+#  Pipeline runner
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_pipeline(passage: str) -> dict:
+def _run_pipeline(passage: str, ground_truth_answer: str | None = None,
+                   gt_options: dict | None = None,
+                   reference_question: str | None = None) -> dict:
     """
-    Orchestrates Model A (Flan-T5) and Model B (Classical ML).
-    Returns a combined result dict stored in session_state.
+    Generate question, distractors, and hints. Picks ground-truth answer when
+    provided (RACE sample); otherwise the system picks the longest option-like
+    candidate phrase from the passage.
     """
-    model_a: FlanT5Generator = load_model_a()
-    model_b: ModelBPipeline  = load_model_b()
-
-    # ── Model A: generate question + extract answer ──────────────────────────
-    with st.spinner("Model A (Flan-T5): generating question & answer …"):
-        t0 = time.time()
-        a_result = model_a.run_pipeline(passage)
-        latency_a = round(time.time() - t0, 3)
-
-    question = a_result["question"]
-    answer   = a_result["answer"]
-
-    # ── Ground-truth options from RACE sample (None for custom-pasted text) ──
-    # Used by Model B for live P/R/F1 and by NLP eval for real reference scoring.
-    sample = st.session_state.get("current_sample")
-    gt_options = (
-        {"A": sample["A"], "B": sample["B"], "C": sample["C"], "D": sample["D"]}
-        if sample else None
-    )
-    reference_question = sample["question"] if sample else None
-
-    # ── Model B: generate distractors + hints ───────────────────────────────
-    with st.spinner("Model B (Classical ML): generating distractors & hints …"):
-        t0 = time.time()
-        b_result = model_b.run_pipeline(
-            passage, question, answer,
-            ground_truth_options=gt_options,   # <-- real scoring, not hardcoded
-        )
-        latency_b = round(time.time() - t0, 3)
-
-    distractors = b_result["distractors"]    # list of 3 strings
-    hints       = b_result["hints"]          # list of 3 strings
-
-    # ── Build shuffled options A–D ───────────────────────────────────────────
-    options = distractors[:3] + [answer]
-    random.shuffle(options)
-    correct_label = ["A", "B", "C", "D"][options.index(answer)]
-    option_map = dict(zip(["A", "B", "C", "D"], options))
-
-    # ── NLP metrics: score generated question vs RACE reference question ──────
-    # Fix: was score_single(answer, answer) which always returns 1.0.
-    # Now scores the Model A generated question against the true RACE question
-    # when a sample is loaded; gracefully returns zeros for custom passages.
-    if reference_question:
-        nlp_metrics = score_single(question, reference_question)
+    # Determine answer text used as input to the generator
+    if ground_truth_answer:
+        answer_text = ground_truth_answer
     else:
-        nlp_metrics = {"bleu_1": 0.0, "bleu_2": 0.0, "bleu_3": 0.0, "bleu_4": 0.0,
-                       "rouge_l_precision": 0.0, "rouge_l_recall": 0.0, "rouge_l_f1": 0.0,
-                       "meteor": 0.0, "num_samples": 0}
+        # Heuristic for custom-pasted text: use first 4 words as a stub answer
+        answer_text = " ".join(passage.split()[:4]) or "the topic"
 
-    result = {
-        "passage":            passage,
-        "question":           question,
-        "answer":             answer,
-        "correct_label":      correct_label,
-        "option_map":         option_map,
-        "hints":              hints,
-        "latency_a":          latency_a,
-        "latency_b":          latency_b,
-        "distractors":        b_result["distractors"],
-        "b_metrics":          b_result["b_metrics"],   # live P/R/F1 from evaluate_row
-        "nlp_metrics":        nlp_metrics,             # real hypothesis vs reference
-        "has_race_reference": sample is not None,
+    # Generate question
+    t0 = time.perf_counter()
+    question = generate_question(passage, answer_text)
+    latency_q_ms = (time.perf_counter() - t0) * 1000
+    st.session_state.latency_log.append(latency_q_ms)
+
+    # Generate distractors
+    t0 = time.perf_counter()
+    distractors = generate_distractors(passage, question, answer_text)
+    latency_d_ms = (time.perf_counter() - t0) * 1000
+    st.session_state.latency_log.append(latency_d_ms)
+
+    # Generate hints
+    t0 = time.perf_counter()
+    hints = generate_hints(passage, question, answer_text)
+    latency_h_ms = (time.perf_counter() - t0) * 1000
+    st.session_state.latency_log.append(latency_h_ms)
+
+    # Build options A–D with shuffled positions
+    options_list = list(distractors[:3]) + [answer_text]
+    rng = random.Random(42)
+    rng.shuffle(options_list)
+    correct_label = ["A", "B", "C", "D"][options_list.index(answer_text)]
+    option_map = dict(zip(["A", "B", "C", "D"], options_list))
+
+    # Per-inference NLP score (if reference question available)
+    nlp_metrics = {}
+    if reference_question:
+        from src.evaluate_nlp import score_single
+        nlp_metrics = score_single(question, reference_question)
+
+    return {
+        "passage": passage,
+        "question": question,
+        "answer": answer_text,
+        "correct_label": correct_label,
+        "option_map": option_map,
+        "distractors": distractors,
+        "hints": hints,
+        "latency_q_ms": round(latency_q_ms, 2),
+        "latency_d_ms": round(latency_d_ms, 2),
+        "latency_h_ms": round(latency_h_ms, 2),
+        "nlp_metrics": nlp_metrics,
+        "has_race_reference": reference_question is not None,
     }
-    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREEN 1 — Article Input
+#  Screen 1 — Article Input
 # ══════════════════════════════════════════════════════════════════════════════
 
 def screen_input():
     st.header("🏠 Screen 1 — Article Input")
-    st.caption("Paste a reading passage below, upload a .txt file, or load a random RACE sample.")
+    st.caption("Paste a passage, upload a .txt file, or load a random RACE sample.")
 
     col_left, col_right = st.columns([3, 1])
-
     with col_right:
         st.markdown("#### Quick Load")
         if st.button("🎲 Random RACE Sample", use_container_width=True):
@@ -263,61 +225,77 @@ def screen_input():
                 st.session_state.race_samples = load_race_samples()
             if st.session_state.race_samples:
                 sample = random.choice(st.session_state.race_samples)
-                st.session_state.passage        = sample["article"]
-                st.session_state.current_sample = sample   # keep for ground-truth scoring
+                st.session_state.passage = sample["article"]
+                st.session_state.current_sample = sample
             else:
-                st.warning("RACE dataset unavailable. Paste text manually.")
+                st.warning("No RACE samples available. Run preprocessing.py first.")
 
         uploaded = st.file_uploader("Upload .txt", type=["txt"])
         if uploaded:
             st.session_state.passage = uploaded.read().decode("utf-8")
+            st.session_state.current_sample = None
 
     with col_left:
         passage = st.text_area(
             "Reading Passage",
             value=st.session_state.passage,
             height=320,
-            placeholder="Paste or upload a reading passage here …",
+            placeholder="Paste a reading passage of at least 30 words …",
             key="passage_area",
         )
         st.session_state.passage = passage
 
     word_count = len(passage.split()) if passage.strip() else 0
     st.caption(f"Word count: {word_count}")
-
     if word_count < 30:
-        st.info("Please provide a passage of at least 30 words for best results.")
+        st.info("Please provide a passage of at least 30 words.")
 
     st.divider()
+    if st.button("🚀 Generate Quiz", type="primary",
+                 disabled=word_count < 30, use_container_width=False):
+        sample = st.session_state.get("current_sample")
+        gt_answer = sample[sample["answer"]] if sample else None
+        gt_options = (
+            {"A": sample["A"], "B": sample["B"], "C": sample["C"], "D": sample["D"]}
+            if sample else None
+        )
+        ref_q = sample["question"] if sample else None
 
-    if st.button("🚀 Generate Quiz", type="primary", disabled=word_count < 30, use_container_width=False):
-        cleaned = clean_passage(st.session_state.passage)
-        result  = _run_pipeline(cleaned)
+        with st.spinner("Generating quiz with traditional ML pipeline …"):
+            try:
+                result = _run_pipeline(passage, gt_answer, gt_options, ref_q)
+            except FileNotFoundError as e:
+                st.error(f"Models missing: {e}")
+                st.info("Run `python src/preprocessing.py` then "
+                        "`python src/model_a_train.py`, `python src/template_generator.py`, "
+                        "and `python src/model_b_train.py` to train all components.")
+                return
+            except ValueError as e:
+                st.error(str(e))
+                return
+
         st.session_state.pipeline_result = result
-        st.session_state.user_choice     = None
-        st.session_state.answer_checked  = False
-        st.session_state.hints_revealed  = 0
-
-        # Log to session analytics
+        st.session_state.user_choice = None
+        st.session_state.answer_checked = False
+        st.session_state.hints_revealed = 0
         st.session_state.session_log.append({
-            "passage_snippet": cleaned[:100],
-            "question":        result["question"],
-            "answer":          result["answer"],
-            "latency_a":       result["latency_a"],
-            "latency_b":       result["latency_b"],
+            "passage": passage[:80],
+            "question": result["question"],
+            "answer": result["answer"],
+            "latency_q_ms": result["latency_q_ms"],
+            "latency_d_ms": result["latency_d_ms"],
+            "latency_h_ms": result["latency_h_ms"],
         })
-
         st.session_state.screen = "quiz"
         st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREEN 2 — Question & Answer Quiz View
+#  Screen 2 — Quiz View
 # ══════════════════════════════════════════════════════════════════════════════
 
 def screen_quiz():
     st.header("❓ Screen 2 — Quiz View")
-
     result = st.session_state.pipeline_result
     if not result:
         st.warning("No quiz generated yet. Go to Article Input first.")
@@ -325,325 +303,200 @@ def screen_quiz():
 
     st.markdown(f"**Passage excerpt:** _{result['passage'][:200]} …_")
     st.divider()
-
-    # AI-generated badge
-    st.markdown('<span class="ai-badge">⚠️ AI-Generated Question</span>', unsafe_allow_html=True)
+    st.markdown('<span class="ai-badge">⚠️ AI-Generated Question</span>',
+                unsafe_allow_html=True)
     st.markdown(f"### {result['question']}")
-    st.caption(f"Model A (Flan-T5) · Latency: {result['latency_a']} s")
+    st.caption(f"Generation latency: {result['latency_q_ms']:.0f} ms")
 
     st.markdown("---")
     st.markdown("**Choose your answer:**")
-
     for label in ["A", "B", "C", "D"]:
         text = result["option_map"][label]
-        if st.button(f"**{label}.** {text}", key=f"opt_{label}", use_container_width=True):
+        if st.button(f"**{label}.** {text}", key=f"opt_{label}",
+                     use_container_width=True):
             st.session_state.user_choice = label
             st.session_state.answer_checked = False
 
     st.divider()
-
     if st.session_state.user_choice:
         col_check, col_hint = st.columns([1, 1])
         with col_check:
             if st.button("✅ Check Answer", type="primary"):
                 st.session_state.answer_checked = True
-
         with col_hint:
             if st.button("💡 Need a Hint?"):
                 st.session_state.screen = "hints"
                 st.rerun()
 
     if st.session_state.answer_checked and st.session_state.user_choice:
-        chosen  = st.session_state.user_choice
+        chosen = st.session_state.user_choice
         correct = result["correct_label"]
-        chosen_text = result["option_map"][chosen]
 
-        # ── Model A Verifier prediction ──────────────────────────────────────
-        # Pass (passage, question, selected option text) through the traditional
-        # ML ensemble — this satisfies §4.1 verification sub-task requirement.
-        verifier: ModelAVerifier | None = load_verifier()
-        if verifier is not None:
-            verifier_prob  = verifier.predict_proba(
-                result["passage"], result["question"], chosen_text
+        # Verifier prediction
+        try:
+            verifier_label, conf = predict_answer(
+                result["passage"], result["question"], result["option_map"]
             )
-            verifier_pred  = int(verifier_prob >= 0.5)   # 1 = predicts correct
-            verifier_label = "Correct ✓" if verifier_pred == 1 else "Incorrect ✗"
+        except Exception as e:
+            verifier_label, conf = correct, 0.0
+            st.caption(f"Verifier unavailable ({e}).")
 
-            # Ground-truth label for this choice (1 if user picked the right option)
-            ground_truth_label = 1 if chosen == correct else 0
+        # Update verifier log: 1 if verifier picked the same label as ground truth
+        st.session_state.verifier_log.append({
+            "y_true": 1 if chosen == correct else 0,
+            "y_pred": 1 if verifier_label == correct else 0,
+            "confidence": float(conf),
+        })
 
-            # Log for analytics dashboard accumulation
-            st.session_state.setdefault("verifier_log", []).append({
-                "y_true": ground_truth_label,
-                "y_pred": verifier_pred,
-                "prob":   round(verifier_prob, 4),
-            })
-
-        # ── Colour-coded result (ground truth) ──────────────────────────────
         if chosen == correct:
             st.markdown(
                 f'<p class="correct-badge">✅ Correct! '
                 f'The answer is {correct}: {result["option_map"][correct]}</p>',
-                unsafe_allow_html=True,
-            )
+                unsafe_allow_html=True)
             st.balloons()
         else:
             st.markdown(
                 f'<p class="wrong-badge">❌ Incorrect. You chose {chosen}. '
                 f'The correct answer is {correct}: {result["option_map"][correct]}</p>',
-                unsafe_allow_html=True,
-            )
+                unsafe_allow_html=True)
 
-        # ── Model A Verifier verdict ─────────────────────────────────────────
-        if verifier is not None:
-            agree = (verifier_pred == 1) == (chosen == correct)
-            st.markdown(
-                f"**Model A Verifier** (Traditional ML ensemble) — "
-                f"predicted your choice as **{verifier_label}** "
-                f"(confidence: {verifier_prob:.2%}) · "
-                f"{'Agrees with ground truth ✓' if agree else 'Disagrees with ground truth ✗'}"
-            )
-        else:
-            st.caption("Model A verifier not loaded — run `python src/model_a_train.py` first.")
-
-        st.markdown('<span class="ai-badge">⚠️ AI-extracted answer — verify against passage</span>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f"**Model A Verifier (LR+SVM+NB ensemble):** predicted "
+            f"`{verifier_label}` with confidence **{conf:.2%}**."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREEN 3 — Hint Panel
+#  Screen 3 — Hints (graduated)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def screen_hints():
     st.header("💡 Screen 3 — Hint Panel")
-
     result = st.session_state.pipeline_result
     if not result:
         st.warning("No quiz generated yet. Go to Article Input first.")
         return
 
     st.markdown(f"**Question:** _{result['question']}_")
-    st.caption(f"Model B (Classical ML · TF-IDF) · Latency: {result['latency_b']} s")
+    st.caption(f"Hint latency: {result['latency_h_ms']:.0f} ms")
     st.divider()
 
     hints = result.get("hints", [])
-    revealed = st.session_state.hints_revealed
-
     if not hints:
-        st.info("No hints were generated for this passage.")
+        st.info("No hints generated.")
         return
 
-    hint_labels = ["Hint 1 — General Clue", "Hint 2 — More Specific", "Hint 3 — Near-Explicit"]
+    labels = ["Hint 1 — General Clue", "Hint 2 — More Specific",
+              "Hint 3 — Near-Explicit"]
+    revealed = st.session_state.hints_revealed
 
-    for i, (label, hint) in enumerate(zip(hint_labels, hints)):
+    for i, (lbl, hint) in enumerate(zip(labels, hints)):
         if i < revealed:
-            st.markdown(f'<div class="hint-box"><b>{label}:</b> {hint}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="hint-box"><b>{lbl}:</b> {hint}</div>',
+                         unsafe_allow_html=True)
         else:
-            st.markdown(f'<div class="hint-box" style="filter:blur(4px);user-select:none"><b>{label}:</b> {hint}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="hint-box" style="filter:blur(4px);user-select:none">'
+                f'<b>{lbl}:</b> {hint}</div>',
+                unsafe_allow_html=True)
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
         if revealed < len(hints):
-            if st.button("🔓 Reveal Next Hint", type="primary"):
+            if st.button("🔓 Show Next Hint", type="primary"):
                 st.session_state.hints_revealed += 1
                 st.rerun()
         else:
             st.success("All hints revealed.")
 
     with col_b:
-        if revealed >= len(hints):
-            if st.button("🏳️ Reveal Answer"):
-                st.info(f"**Correct Answer:** {result['answer']}")
+        if st.button("🏳️ Reveal Answer",
+                     disabled=(revealed < len(hints))):
+            st.info(f"**Correct Answer:** {result['answer']}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SCREEN 4 — Analytics Dashboard
+#  Screen 4 — Analytics
 # ══════════════════════════════════════════════════════════════════════════════
 
 def screen_analytics():
     import plotly.graph_objects as go
 
     st.header("📊 Screen 4 — Analytics Dashboard")
-    st.caption("Per professor's directive: Model A is evaluated with BLEU, ROUGE-L, and METEOR (text generation metrics). "
-               "Model B uses Precision / Recall / F1 for distractor ranking.")
 
-    result = st.session_state.pipeline_result
-    log    = st.session_state.session_log
-
-    # ── Model A — Verification Classification Metrics ────────────────────────
-    st.subheader("Model A — Verification Metrics (Traditional ML Ensemble)")
-    st.caption(
-        "Accuracy, Macro F1, and Confusion Matrix from the LR + SVM + NB soft-vote "
-        "verifier. Accumulates across all 'Check Answer' clicks this session."
-    )
-
-    verifier_log = st.session_state.get("verifier_log", [])
+    # ── Verifier classification metrics ──────────────────────────────────────
+    st.subheader("Model A — Verifier Performance (session)")
+    verifier_log = st.session_state.verifier_log
     if not verifier_log:
         st.info("Use **Check Answer** on Screen 2 to accumulate verifier predictions.")
     else:
-        import numpy as _np
-        from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+        from sklearn.metrics import (accuracy_score, precision_score,
+                                       recall_score, f1_score, confusion_matrix)
+        y_true = np.array([e["y_true"] for e in verifier_log])
+        y_pred = np.array([e["y_pred"] for e in verifier_log])
+        acc = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+        recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+        f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
 
-        y_true = _np.array([e["y_true"] for e in verifier_log])
-        y_pred = _np.array([e["y_pred"] for e in verifier_log])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Accuracy", f"{acc:.3f}")
+        c2.metric("Precision (macro)", f"{precision:.3f}")
+        c3.metric("Recall (macro)", f"{recall:.3f}")
+        c4.metric("F1 (macro)", f"{f1:.3f}")
 
-        acc     = accuracy_score(y_true, y_pred)
-        macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
-        prec    = f1_score(y_true, y_pred, average="binary", pos_label=1,
-                           zero_division=0)
-        rec     = f1_score(y_true, y_pred, average="binary", pos_label=1,
-                           zero_division=0)
-        cm      = confusion_matrix(y_true, y_pred, labels=[0, 1])
-
-        col_v1, col_v2, col_v3, col_v4 = st.columns(4)
-        col_v1.metric("Accuracy",      f"{acc:.3f}",      help="Fraction of correct verifier predictions")
-        col_v2.metric("Macro F1",      f"{macro_f1:.3f}", help="Handles class imbalance (§4.5)")
-        col_v3.metric("Precision",     f"{prec:.3f}",     help="Of predicted-correct, how many were right")
-        col_v4.metric("Samples",       len(verifier_log), help="Check Answer clicks this session")
-
-        # Confusion Matrix
-        st.markdown("**Confusion Matrix** — Verifier predictions vs ground truth")
-        tn, fp_v, fn_v, tp_v = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-        col_cm_a, col_cm_b, col_cm_c, col_cm_d = st.columns(4)
-        col_cm_a.metric("True Positives",  int(tp_v), help="Verifier correctly predicted correct answer")
-        col_cm_b.metric("True Negatives",  int(tn),   help="Verifier correctly predicted wrong answer")
-        col_cm_c.metric("False Positives", int(fp_v), help="Verifier said correct when actually wrong")
-        col_cm_d.metric("False Negatives", int(fn_v), help="Verifier said wrong when actually correct")
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+        if cm.size == 4:
+            tn, fp, fn, tp = cm.ravel()
+            st.markdown("**Confusion Matrix**")
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("TP", int(tp)); cc2.metric("TN", int(tn))
+            cc3.metric("FP", int(fp)); cc4.metric("FN", int(fn))
 
     st.divider()
 
-    # ── Model A — NLP Metrics ─────────────────────────────────────────────────
-    st.subheader("Model A — NLP Generation Metrics (BLEU · ROUGE-L · METEOR)")
-    st.markdown(
-        "> **Note:** For a full corpus-level evaluation against RACE reference questions, "
-        "run `python src/evaluate_nlp.py --predictions preds.txt --references refs.txt`. "
-        "The scores below are computed for the *current* inference (single-sample)."
-    )
-
-    if result:
-        metrics = result.get("nlp_metrics", {})
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("BLEU-1",     f"{metrics.get('bleu_1', 0):.4f}")
-        col2.metric("BLEU-4",     f"{metrics.get('bleu_4', 0):.4f}")
-        col3.metric("ROUGE-L F1", f"{metrics.get('rouge_l_f1', 0):.4f}")
-        col4.metric("METEOR",     f"{metrics.get('meteor', 0):.4f}")
-
-        # BLEU bar chart
-        bleu_vals = [metrics.get(f"bleu_{n}", 0) for n in range(1, 5)]
-        fig = go.Figure(go.Bar(
-            x=["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4"],
-            y=bleu_vals,
-            marker_color=["#6366f1", "#818cf8", "#a5b4fc", "#c7d2fe"],
-            text=[f"{v:.4f}" for v in bleu_vals],
-            textposition="outside",
-        ))
-        fig.update_layout(title="BLEU-1 through BLEU-4 (current inference)",
-                          yaxis_range=[0, 1], height=320, margin=dict(t=40, b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-        # ROUGE-L breakdown
-        col_r1, col_r2, col_r3 = st.columns(3)
-        col_r1.metric("ROUGE-L Precision", f"{metrics.get('rouge_l_precision', 0):.4f}")
-        col_r2.metric("ROUGE-L Recall",    f"{metrics.get('rouge_l_recall', 0):.4f}")
-        col_r3.metric("ROUGE-L F1",        f"{metrics.get('rouge_l_f1', 0):.4f}")
+    # ── Corpus-level NLP metrics from metrics_test.json ──────────────────────
+    st.subheader("Corpus-level NLP Metrics (BLEU · ROUGE-L · METEOR)")
+    metrics = load_test_metrics()
+    if metrics is None:
+        st.info("Run `python src/evaluate_nlp.py` to generate metrics_test.json.")
     else:
-        st.info("Run a quiz first (Screen 1) to see metrics.")
+        for section_key, section_title in (
+            ("model_a", "Model A — Question Generation"),
+            ("model_b_distractors", "Model B — Distractors"),
+            ("model_b_hints", "Model B — Hints"),
+        ):
+            block = metrics.get(section_key, {})
+            if not block:
+                continue
+            st.markdown(f"**{section_title}** (n={block.get('num_samples', '—')})")
+            cols = st.columns(4)
+            cols[0].metric("BLEU-1", f"{block.get('bleu_1', 0):.4f}")
+            cols[1].metric("BLEU-4", f"{block.get('bleu_4', 0):.4f}")
+            cols[2].metric("ROUGE-L F1", f"{block.get('rouge_l_f1', 0):.4f}")
+            cols[3].metric("METEOR", f"{block.get('meteor', 0):.4f}")
 
     st.divider()
 
-    # ── Model B — Distractor Quality Metrics ──────────────────────────────────
-    st.subheader("Model B — Distractor Quality (Classical ML)")
-    st.caption("Precision / Recall / F1 measure how well the TF-IDF ranker selects plausible-but-wrong distractors.")
-
-    if result:
-        b_metrics = result.get("b_metrics", {})
-        has_ref   = b_metrics.get("has_reference", False)
-
-        if not has_ref:
-            st.info(
-                "💡 Metrics require a RACE ground-truth reference. "
-                "Load a **Random RACE Sample** on Screen 1 to see live scores."
-            )
-        else:
-            col_b1, col_b2, col_b3 = st.columns(3)
-            col_b1.metric("Distractor Precision", f"{b_metrics.get('precision', 0.0):.3f}")
-            col_b2.metric("Distractor Recall",    f"{b_metrics.get('recall',    0.0):.3f}")
-            col_b3.metric("Distractor F1",        f"{b_metrics.get('f1',        0.0):.3f}")
-
-            # ── Confusion Matrix ─────────────────────────────────────────────
-            tp = b_metrics.get("tp", 0)
-            fp = b_metrics.get("fp", 0)
-            fn = b_metrics.get("fn", 0)
-
-            st.markdown("**Pseudo-Confusion Matrix** — Generated vs Ground-Truth Distractors")
-            st.caption(
-                "TP = generated distractor matched a GT option · "
-                "FP = generated distractor had no GT match · "
-                "FN = GT distractor the model missed · "
-                "TN = undefined for open-ended generation"
-            )
-
-            import pandas as _pd
-            cm_df = _pd.DataFrame(
-                {
-                    "Pred: Match": [tp, fp],
-                    "Pred: No Match (TN undefined)": ["N/A", "N/A"],
-                },
-                index=["GT: Has matching option (TP/FN)", "GT: No matching option (FP)"],
-            )
-            # Display as simple metric cards instead of a dataframe for clarity
-            col_cm1, col_cm2, col_cm3 = st.columns(3)
-            col_cm1.metric("True Positives (TP)",  tp,
-                           help="Generated distractors that overlap a GT distractor")
-            col_cm2.metric("False Positives (FP)", fp,
-                           help="Generated distractors with no matching GT option")
-            col_cm3.metric("False Negatives (FN)", fn,
-                           help="GT distractors the model failed to cover")
-
-    st.divider()
-
-    # ── Latency Tracking ──────────────────────────────────────────────────────
+    # ── Latency tracking ─────────────────────────────────────────────────────
     st.subheader("Inference Latency")
+    if st.session_state.latency_log:
+        lat = st.session_state.latency_log
+        fig = go.Figure(go.Scatter(y=lat, mode="lines+markers"))
+        fig.update_layout(yaxis_title="Latency (ms)", xaxis_title="Inference call #",
+                          height=300, title="Per-inference latency (this session)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"Mean latency: {np.mean(lat):.1f} ms · "
+                   f"Max: {np.max(lat):.1f} ms")
 
-    if log:
-        import pandas as pd
-        df = pd.DataFrame(log)
-        df.index += 1
-        df.columns = ["Passage", "Question", "Answer", "Latency A (s)", "Latency B (s)"]
+    # ── Session log + CSV download ───────────────────────────────────────────
+    if st.session_state.session_log:
+        st.subheader("Session Log")
+        df = pd.DataFrame(st.session_state.session_log)
         st.dataframe(df, use_container_width=True)
-
-        # Latency line chart
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(y=df["Latency A (s)"], mode="lines+markers", name="Model A (Flan-T5)"))
-        fig2.add_trace(go.Scatter(y=df["Latency B (s)"], mode="lines+markers", name="Model B (Classical ML)"))
-        fig2.update_layout(title="Inference Latency per Request", yaxis_title="Seconds",
-                           xaxis_title="Request #", height=300)
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # Export CSV
-        csv = df.to_csv(index=True).encode("utf-8")
+        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Export Session Log (CSV)", csv,
                            file_name="session_log.csv", mime="text/csv")
-    else:
-        st.info("No inferences logged yet. Run a quiz first.")
-
-    st.divider()
-
-    # ── Evaluation Instructions ────────────────────────────────────────────────
-    with st.expander("🔬 Run Full RACE Corpus Evaluation"):
-        st.code("""
-# Step 1: Generate predictions over RACE test split
-python src/run_batch_eval.py --split test --max-samples 500 \\
-       --output-preds data/processed/preds.txt \\
-       --output-refs  data/processed/refs.txt
-
-# Step 2: Compute BLEU / ROUGE-L / METEOR
-python src/evaluate_nlp.py \\
-       --predictions data/processed/preds.txt \\
-       --references  data/processed/refs.txt \\
-       --output-json results/nlp_metrics.json
-        """, language="bash")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
