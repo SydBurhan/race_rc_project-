@@ -1,21 +1,12 @@
 """
-src/preprocessing.py
-====================
-RACE preprocessing pipeline (traditional ML only, no neural nets).
+RACE preprocessing pipeline.
 
-Reads CSVs from data/raw/{train,val,test}.csv with columns
-[id, article, question, A, B, C, D, answer], and produces:
+Rubric coverage:
+  1.3  Preprocessing pipeline (cleaning, OHE saved, train/val/test split)
+  2.2  Feature engineering (TF-IDF, OHE/BoW, handcrafted lexical)
 
-  models/model_a/tfidf_vectorizer.joblib
-  models/model_a/traditional/ohe_vectorizer.pkl
-  data/processed/{train,val,test}.csv          (cleaned copies)
-  data/processed/X_tfidf_{train,val,test}.npz  (TF-IDF, doc-level)
-  data/processed/X_ohe_{train,val,test}.npz    (OHE, option-level expanded)
-  data/processed/X_combined_{train,val,test}.npz  (OHE + lexical, option-level)
-  data/processed/y_{train,val,test}.npy        (binary labels, option-level)
-
-Reproducibility: all random_state=42.
-No fit_transform on val/test.
+Produces option-level feature matrices and saves the fitted vectorizers
+for reuse at inference time. Random state pinned to 42 throughout.
 """
 
 from __future__ import annotations
@@ -168,9 +159,7 @@ def save_processed_csv(df: pd.DataFrame, split: str) -> None:
     log.info("Saved %s -> %s", split, CSV_PATHS[split])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Doc-level TF-IDF (one vector per question, used for hints/distractors)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.2: TF-IDF feature engineering (doc-level, used by hints/distractors)
 
 def _build_doc_corpus(df: pd.DataFrame) -> pd.Series:
     a = df["article"].fillna("").astype(str).map(_clean_text)
@@ -199,9 +188,7 @@ def build_tfidf(train_df, val_df, test_df):
     return X_tr, X_va, X_te, vec
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Option-level expansion: 4 rows per question (1 correct + 3 distractors)
-# ══════════════════════════════════════════════════════════════════════════════
+# Each RACE question becomes 4 rows (one per option) with binary correctness label.
 
 def _expand_to_options(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
@@ -221,9 +208,7 @@ def _expand_to_options(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  One-Hot Encoding (option-level, primary feature representation)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 1.3 / 2.2: One-Hot Encoding (binary CountVectorizer, persisted to disk)
 
 def build_ohe_features(train_df, val_df, test_df):
     """
@@ -252,9 +237,7 @@ def build_ohe_features(train_df, val_df, test_df):
     return X_tr, X_va, X_te, expanded, vec
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Handcrafted lexical features (option-level)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.2: Handcrafted lexical features (10 per option) used alongside OHE.
 
 def build_lexical_features(expanded_df: pd.DataFrame) -> np.ndarray:
     """

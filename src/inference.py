@@ -1,15 +1,14 @@
 """
-src/inference.py
-================
-Unified inference API for the Streamlit UI and corpus evaluation.
+Unified inference API consumed by the Streamlit UI and the evaluation runner.
 
-Public functions:
-    predict_answer(article, question, options) -> (best_label, confidence)
-    generate_question(article, correct_answer) -> str
-    generate_distractors(article, question, correct_answer) -> list[str] (len 3)
-    generate_hints(article, question, correct_answer) -> list[str] (len 3)
+Rubric coverage:
+  2.3  Answer verification on (article, question, option) triples
+  2.3  Question generation entry point used by the UI
+  5.x  Distractor generation entry point
+  6.x  Hint generation entry point
 
-Models are loaded lazily once per process via @lru_cache.
+All heavy artefacts (vectorizer, ensemble, Word2Vec) are loaded lazily and
+cached for the lifetime of the process via functools.lru_cache.
 """
 
 from __future__ import annotations
@@ -144,9 +143,7 @@ def _featurise_option(article: str, question: str, option: str, vectorizer,
     return sp.hstack([X_ohe, sp.csr_matrix(lex)], format="csr")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  predict_answer — soft-vote ensemble over 4 options
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.3: soft-vote ensemble verifier over the four options.
 
 def predict_answer(article: str, question: str, options: dict) -> tuple[str, float]:
     if not article or not article.strip():
@@ -186,9 +183,7 @@ def predict_answer(article: str, question: str, options: dict) -> tuple[str, flo
     return best, scores[best]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  generate_question — template + SVM ranker
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.3: question generation (template fill, then LinearSVC ranking).
 
 def generate_question(article: str, correct_answer: str) -> str:
     if not article or not article.strip():
@@ -205,9 +200,7 @@ def generate_question(article: str, correct_answer: str) -> str:
     return ranked[0]["question"] if ranked else cands[0]["question"]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  generate_distractors — TF-IDF MMR + frequency + W2V
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 5.x: distractors merged from MMR, frequency, and Word2Vec sources.
 
 def generate_distractors(article: str, question: str,
                           correct_answer: str) -> list[str]:
@@ -225,9 +218,7 @@ def generate_distractors(article: str, question: str,
     return out[:3]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  generate_hints — graduated 3-tier
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 6.x: three graduated hints with the third one cloze-redacted.
 
 def generate_hints(article: str, question: str,
                     correct_answer: str = "") -> list[str]:

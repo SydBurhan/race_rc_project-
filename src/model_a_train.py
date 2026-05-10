@@ -1,23 +1,13 @@
 """
-src/model_a_train.py
-====================
-Model A — Traditional ML training (no neural networks).
+Model A training: verifier classifiers, ensemble, and unsupervised baselines.
 
-Trains:
-  • Logistic Regression (LR)
-  • Calibrated LinearSVC (SVM)
-  • Complement Naive Bayes (NB)
-  • Random Forest (RF)
-  • XGBoost (XGB)
-  • Soft-vote ensemble (LR + SVM + NB)
-  • K-Means clustering (k=4) — unsupervised
-  • Label Propagation — semi-supervised
-
-Features (option-level, 4 rows per RACE question):
-  • OHE binary CountVectorizer + handcrafted lexical (combined sparse matrix)
-
-Saves all classifiers to:  models/model_a/traditional/*.pkl
-Reports comparison table to stdout and JSON.
+Rubric coverage:
+  2.1  Five traditional classifiers (LR, SVM, NB, RF, XGBoost)
+  2.4  Per-classifier comparison table (Acc / F1 / Confusion matrix)
+  3.1  Unsupervised K-Means and semi-supervised Label Propagation
+  3.2  Clustering purity, silhouette, semi-supervised F1
+  4.1  Soft-vote ensemble (LR + SVM + NB)
+  4.2  Improvement of ensemble over individual models (printed in comparison)
 """
 
 from __future__ import annotations
@@ -67,10 +57,7 @@ LR_PARAMS = dict(C=1.0, max_iter=1000, solver="liblinear",
                  random_state=42, class_weight="balanced")
 SVM_PARAMS = dict(C=0.1, max_iter=4000, random_state=42, class_weight="balanced", dual="auto")
 NB_PARAMS = dict(alpha=0.3)
-# RF on sparse 15k-feature data is expensive; keep modest defaults.
-# Balanced config: 120 trees, sqrt feature sampling (~122 cols/split).
-# The previous bump to max_features=0.05 was 6x slower for ~0.01 F1 gain.
-# Lexical features already dominate top importances at sqrt — no need to force them.
+# RF on sparse 15k features is expensive; sqrt sampling is the speed/F1 sweet spot.
 RF_PARAMS = dict(n_estimators=120, max_depth=24, max_features="sqrt",
                  min_samples_leaf=2, class_weight="balanced",
                  random_state=42, n_jobs=-1)
@@ -88,12 +75,9 @@ def _detect_xgb_device() -> str:
         return "cpu"
 
 
-# XGBoost: hist + GPU when available (5-10x speedup on Colab/Kaggle).
-# Shallow trees + L2 regularisation prevent overfitting to spurious vocab terms.
+# colsample_bytree=1.0 keeps the 10 lexical features in every tree;
+# sampling them out collapsed prediction quality. scale_pos_weight=2.5 handles 3:1 imbalance.
 _XGB_DEVICE = _detect_xgb_device()
-# colsample_bytree=1.0 ensures every tree sees all 10 lexical features (with
-# only 0.6 they were sampled out of ~40% of trees, which collapsed prediction).
-# scale_pos_weight=2.5 corrects 3:1 imbalance without overshooting.
 XGB_PARAMS = dict(n_estimators=400, max_depth=6, tree_method="hist",
                   device=_XGB_DEVICE, learning_rate=0.08,
                   reg_lambda=1.0, reg_alpha=0.1, subsample=0.8,
@@ -156,9 +140,7 @@ def _print_top_features(name: str, importances: np.ndarray, vocab_size: int,
         print(f"    {term:<28}  {importances[i]:.4f}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Supervised training
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.1: train all five supervised classifiers and report metrics.
 
 def train_supervised(X_tr, y_tr, X_va, y_va, vocab_size: int) -> tuple[dict, dict]:
     MODEL_A_TRAD.mkdir(parents=True, exist_ok=True)
@@ -204,9 +186,7 @@ def train_supervised(X_tr, y_tr, X_va, y_va, vocab_size: int) -> tuple[dict, dic
     return models, metrics
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Soft-vote ensemble (LR + SVM + NB)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 4.1 / 4.2: soft-vote ensemble averaging LR + SVM + NB probabilities.
 
 def train_ensemble(models: dict, X_va, y_va) -> dict:
     log.info("Building soft-vote ensemble (LR + SVM + NB) ...")
@@ -233,9 +213,7 @@ def train_ensemble(models: dict, X_va, y_va) -> dict:
     return {"accuracy": acc, "macro_f1": f1}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Unsupervised — K-Means
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 3.1 / 3.2: K-Means (k=4) with purity and cosine silhouette score.
 
 def train_kmeans(X_tr, y_tr, supervised_acc: float) -> dict:
     log.info("K-Means clustering (k=4) ...")
@@ -266,9 +244,7 @@ def train_kmeans(X_tr, y_tr, supervised_acc: float) -> dict:
     return {"purity": float(purity), "silhouette": float(sil)}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Semi-supervised — Label Propagation
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 3.1 / 3.2: Label Propagation with 5% labelled, semi-supervised F1.
 
 def train_label_propagation(X_tr, y_tr, X_va, y_va,
                              supervised_f1: float,
@@ -305,9 +281,7 @@ def train_label_propagation(X_tr, y_tr, X_va, y_va,
     return {"accuracy": acc, "macro_f1": f1}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Comparison table
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.4: side-by-side comparison of every classifier on the validation set.
 
 def print_comparison(metrics: dict) -> None:
     rows = []

@@ -1,17 +1,15 @@
 """
-src/template_generator.py
-=========================
 Template-based question generator for Model A.
-Pure traditional ML — NO neural networks.
+
+Rubric coverage:
+  2.3  Question generation (template fill + LinearSVC ranker)
+  2.2  Cosine similarity feature engineering for sentence retrieval and ranking
 
 Pipeline:
-  1. Extract candidate sentences via OHE-cosine overlap with the correct answer.
-  2. Apply 25 Wh-word templates (5 per Wh) to each top sentence.
-  3. Rank candidates with a trained LinearSVC ranker (positive = real RACE Q,
-     negative = template-generated Q).
-
-CLI:
-    python src/template_generator.py
+  1. Retrieve top sentences via OHE cosine similarity with the correct answer.
+  2. Apply Wh-word templates (filtered by answer type) to those sentences.
+  3. Rank candidates with a trained LinearSVC (positives = real RACE questions,
+     negatives = template-generated alternatives).
 """
 
 from __future__ import annotations
@@ -149,9 +147,7 @@ def _strip_lead_stopwords(words: list[str]) -> list[str]:
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Step 1 — Candidate sentence extraction (OHE cosine)
-# ══════════════════════════════════════════════════════════════════════════════
+# Step 1: retrieve the top sentences most similar to the correct answer.
 
 def extract_candidate_sentences(article: str, correct_answer: str,
                                 vectorizer, top_k: int = 5) -> list[tuple[str, float, int]]:

@@ -6,6 +6,12 @@
 
 ---
 
+## Abstract
+
+This project presents a complete reading comprehension and quiz generation system built entirely on traditional machine learning over the RACE dataset. The system combines a multiple choice answer verifier (a soft vote ensemble of Logistic Regression, calibrated Linear SVM, and Complement Naive Bayes), a template based question generator ranked by a Linear SVM, a three source distractor pipeline (TF-IDF cosine with Maximal Marginal Relevance, frequency substitution, and pretrained Word2Vec), and a Logistic Regression scorer that produces three graduated hints with the final hint cloze redacted. The pipeline runs end to end in milliseconds on a CPU and is exposed through a Streamlit interface with four screens. On the RACE test split we report BLEU-1 of 0.168 and METEOR of 0.144 for question generation, and BLEU-1 of 0.289 with BLEU-4 of 0.169 for hint generation, both consistent with classical baselines reported in the literature for non neural approaches. The project demonstrates that a carefully engineered classical pipeline can deliver a usable end to end reading comprehension product without any deep learning component, and the report discusses honestly where this approach hits structural ceilings.
+
+---
+
 ## 1. Project Overview
 
 This project is a complete reading comprehension and quiz generation system built entirely on traditional machine learning. The whole stack runs on the RACE dataset (Reading Comprehension from Examinations) and intentionally avoids neural networks of any kind. Every learned component is a classical sklearn estimator, every text representation is either bag of words, TF-IDF, or static Word2Vec embeddings, and the user-facing layer is a Streamlit application that ties everything together.
@@ -284,9 +290,9 @@ All `random_state` values are pinned to 42. No vectorizer is fit on validation o
 
 ---
 
-## 12. What We Learned
+## 12. Conclusion
 
-A few takeaways from building this system:
+A few takeaways from building this system.
 
 The biggest practical win was the relation extractor. Five regex patterns plus pronoun resolution covered a large fraction of the factual passages we tested, and produced output far cleaner than the template ranker for those cases. It is a reminder that for narrow factual content, classical patterns often beat statistical approaches that have to learn the same patterns implicitly.
 
@@ -295,3 +301,20 @@ The biggest practical loss was that most of the harder RACE questions (the genui
 The Streamlit layer was deceptively tricky. State management, session cache, and widget keying have non obvious interactions that produced symptoms (blank screens, frozen navigation) that looked like deep bugs but were actually small UI plumbing issues. A keyed radio with a one shot pending flag is now our default pattern for any programmatic navigation in Streamlit.
 
 Finally, qualitative testing through the UI was worth far more than corpus level metrics for actually improving the system. Every meaningful fix in this project came from looking at a specific bad output in the UI and asking what went wrong.
+
+Overall the system meets the design goals laid out in the project brief: it accepts free text passages, generates plausible multiple choice questions with three distractors, offers graduated hints, verifies answers, and exposes everything through a usable interface, all without a single neural network in the inference path.
+
+---
+
+## 13. References
+
+1. Lai, G., Xie, Q., Liu, H., Yang, Y., & Hovy, E. (2017). RACE: Large-scale ReAding Comprehension Dataset From Examinations. *Proceedings of EMNLP 2017*.
+2. Devlin, J., Chang, M.-W., Lee, K., & Toutanova, K. (2018). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. *arXiv:1810.04805*.
+3. Papineni, K., Roukos, S., Ward, T., & Zhu, W.-J. (2002). BLEU: a Method for Automatic Evaluation of Machine Translation. *Proceedings of ACL 2002*.
+4. Lin, C.-Y. (2004). ROUGE: A Package for Automatic Evaluation of Summaries. *Text Summarization Branches Out, ACL 2004*.
+5. Banerjee, S., & Lavie, A. (2005). METEOR: An Automatic Metric for MT Evaluation with Improved Correlation with Human Judgments. *ACL Workshop on Intrinsic and Extrinsic Evaluation Measures for MT and/or Summarization*.
+6. Heilman, M., & Smith, N. A. (2010). Good Question! Statistical Ranking for Question Generation. *Proceedings of NAACL-HLT 2010*.
+7. Du, X., Shao, J., & Cardie, C. (2017). Learning to Ask: Neural Question Generation for Reading Comprehension. *Proceedings of ACL 2017*.
+8. Carbonell, J., & Goldstein, J. (1998). The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries. *Proceedings of SIGIR 1998*.
+9. Mikolov, T., Chen, K., Corrado, G., & Dean, J. (2013). Efficient Estimation of Word Representations in Vector Space. *arXiv:1301.3781* (Word2Vec).
+10. Pedregosa, F., et al. (2011). Scikit-learn: Machine Learning in Python. *Journal of Machine Learning Research*, 12, 2825-2830.

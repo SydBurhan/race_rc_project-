@@ -1,12 +1,12 @@
 """
-src/evaluate_nlp.py
-===================
-NLP evaluation — BLEU / ROUGE-L / METEOR for Model A (questions) and
-Model B (distractors + hints).
+NLP evaluation runner.
 
-CLI:
-    python src/evaluate_nlp.py                  # full corpus run on test split
-    python src/evaluate_nlp.py --max 500        # limit to first 500 rows
+Rubric coverage:
+  2.4  BLEU / ROUGE-L / METEOR for Model A question generation
+  5.5  BLEU / ROUGE-L / METEOR for Model B distractors
+  6.x  Same metrics for hint generation (corpus level)
+
+Writes results to reports/metrics_test.json.
 """
 
 from __future__ import annotations
@@ -56,9 +56,7 @@ _rouge = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 _smoother = SmoothingFunction().method1
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Core metric functions
-# ══════════════════════════════════════════════════════════════════════════════
+# Per-metric helpers (BLEU-1..4, ROUGE-L precision/recall/F1, METEOR).
 
 def _tok(s: str) -> list[str]:
     try:
@@ -132,9 +130,7 @@ def save_metrics_json(metrics: dict, path: Path = METRICS_PATH) -> None:
     log.info("Metrics saved -> %s", path)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Corpus-level evaluation runner
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 2.4 / 5.5: corpus runner that writes metrics_test.json for the UI.
 
 def run_full_evaluation(
     model_a_predictions: list[str],

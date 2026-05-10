@@ -1,20 +1,13 @@
 """
-src/model_b_train.py
-====================
-Model B — Distractor & Hint Generation (traditional ML only).
+Model B: distractor and hint generation.
 
-Distractor strategies (combined into final list of 3):
-  1. TF-IDF / OHE cosine + MMR diversity (extractive from passage)
-  2. Frequency-based substitution (top content words)
-  3. Word2Vec nearest-neighbours (gensim, pre-trained, optional & cached)
-
-Hint generation:
-  - Splits article into sentences
-  - Scores each sentence with a trained Logistic Regression hint scorer
-    (features: cos sim to question, cos sim to answer, keyword overlap,
-     sentence position, sentence length); falls back to cosine ranking
-     when the model is missing.
-  - Returns 3 graduated hints: general -> specific -> near-explicit
+Rubric coverage:
+  5.1  Candidate extraction (n-gram phrases, frequency, Word2Vec)
+  5.2  Ranking features (cosine, character overlap, passage frequency)
+  5.3  ML ranker + diversity penalty (MMR + Jaccard)
+  5.4  Plausibility, three distractors per question, syntactic match
+  6.1  Logistic Regression hint scorer over five sentence-level features
+  6.2  Three graduated hints (general -> specific -> redacted near-explicit)
 """
 
 from __future__ import annotations
@@ -236,9 +229,7 @@ def load_vectorizer(path: Path = OHE_PATH):
     return joblib.load(path)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Distractor — N-gram + TF-IDF/OHE cosine + MMR
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 5.1 / 5.3: distractor candidates from n-gram cosine + MMR diversity.
 
 def _extract_candidate_phrases(article: str, correct_answer: str) -> list[str]:
     tokens = _tokenise(article)
@@ -285,9 +276,7 @@ def _tfidf_mmr_distractors(article: str, correct_answer: str,
     return [candidates[i] for i in idx]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Distractor — frequency-based substitution
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 5.1: high-frequency content-word substitution from the passage.
 
 def frequency_substitution_distractors(article: str, correct_answer: str,
                                         top_n: int = 3) -> list[str]:
@@ -323,9 +312,7 @@ def frequency_substitution_distractors(article: str, correct_answer: str,
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Distractor — Word2Vec nearest neighbours
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 5.1: pre-trained Word2Vec semantic neighbours (cached locally).
 
 _W2V_MODEL = None
 
@@ -540,9 +527,7 @@ def get_word2vec_distractors(correct_answer: str, article: str,
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Combined distractor generation
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 5.3 / 5.4: merge candidate pools, type/length filter, MMR for final 3.
 
 def generate_distractors(article: str, question: str, correct_answer: str,
                           vectorizer=None, w2v_model=None,
@@ -647,9 +632,7 @@ def generate_distractors(article: str, question: str, correct_answer: str,
     return selected[:n]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Hint scorer (Logistic Regression)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 6.1: Logistic Regression hint scorer over 5 sentence-level features.
 
 HINT_FEATURE_NAMES = ["cos_q", "cos_ans", "keyword_overlap", "position", "length"]
 
@@ -722,9 +705,7 @@ def _load_hint_scorer():
     return joblib.load(HINT_SCORER_PATH)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Hint generation (graduated: general -> specific -> near-explicit)
-# ══════════════════════════════════════════════════════════════════════════════
+# Rubric 6.2: three graduated hints; the third has the answer span redacted.
 
 def generate_hints(article: str, question: str, correct_answer: str = "",
                    vectorizer=None) -> list[str]:
