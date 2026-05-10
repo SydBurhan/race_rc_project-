@@ -3,9 +3,12 @@ Model B: distractor and hint generation.
 
 Rubric coverage:
   5.1  Candidate extraction (n-gram phrases, frequency, Word2Vec)
-  5.2  Ranking features (cosine, character overlap, passage frequency)
-  5.3  ML ranker + diversity penalty (MMR + Jaccard)
-  5.4  Plausibility, three distractors per question, syntactic match
+  5.2  Ranking features per candidate (OHE cosine to answer, character-level
+       match score, passage frequency, TF-IDF cosine)
+  5.3  Trained Logistic Regression ranker (persisted via joblib) combined
+       with an MMR diversity penalty
+  5.4  Three distractors per question, type/length/overlap filters for
+       plausibility and syntactic match
   6.1  Logistic Regression hint scorer over five sentence-level features
   6.2  Three graduated hints (general -> specific -> redacted near-explicit)
 """
@@ -39,7 +42,9 @@ PROCESSED_DIR = ROOT / "data" / "processed"
 MODEL_A_TRAD = ROOT / "models" / "model_a" / "traditional"
 MODEL_B_TRAD = ROOT / "models" / "model_b" / "traditional"
 OHE_PATH = MODEL_A_TRAD / "ohe_vectorizer.pkl"
+TFIDF_PATH = ROOT / "models" / "model_a" / "tfidf_vectorizer.joblib"
 HINT_SCORER_PATH = MODEL_B_TRAD / "hint_scorer.pkl"
+DISTRACTOR_RANKER_PATH = MODEL_B_TRAD / "distractor_ranker.pkl"
 W2V_CACHE_PATH = MODEL_B_TRAD / "word2vec_kv.bin"
 
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
@@ -527,7 +532,185 @@ def get_word2vec_distractors(correct_answer: str, article: str,
     return out
 
 
-# Rubric 5.3 / 5.4: merge candidate pools, type/length filter, MMR for final 3.
+# Rubric 5.2 / 5.3: trained Logistic Regression ranker over four features per
+# candidate. Positives are the 3 wrong RACE options for each question; negatives
+# are random non-option n-grams mined from the same article.
+
+DISTRACTOR_FEATURE_NAMES = ["ohe_cosine", "char_overlap", "passage_freq",
+                            "tfidf_cosine"]
+
+
+def _char_overlap(a: str, b: str) -> float:
+    """Character-bigram Dice coefficient between two strings (range 0..1)."""
+    a, b = str(a).lower(), str(b).lower()
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    A = {a[i:i + 2] for i in range(len(a) - 1)}
+    B = {b[i:i + 2] for i in range(len(b) - 1)}
+    if not A or not B:
+        return 0.0
+    return 2.0 * len(A & B) / (len(A) + len(B))
+
+
+def _passage_frequency(candidate: str, article_lc: str,
+                        article_token_count: int) -> float:
+    """Normalised passage frequency: count of candidate in article / |article|."""
+    c = str(candidate).lower().strip()
+    if not c or article_token_count == 0:
+        return 0.0
+    return article_lc.count(c) / float(article_token_count)
+
+
+def _distractor_features(candidate: str, correct_answer: str,
+                          article: str, ohe_vec, tfidf_vec=None) -> np.ndarray:
+    cand = str(candidate)
+    ans = str(correct_answer)
+    art_lc = str(article).lower()
+    art_tok_n = max(1, len(_tokenise(article)))
+
+    ohe_cos = float(cosine_similarity(ohe_vec.transform([cand]),
+                                       ohe_vec.transform([ans])).ravel()[0])
+    char_ov = _char_overlap(cand, ans)
+    freq = _passage_frequency(cand, art_lc, art_tok_n)
+    if tfidf_vec is not None:
+        tfidf_cos = float(cosine_similarity(tfidf_vec.transform([cand]),
+                                             tfidf_vec.transform([ans])).ravel()[0])
+    else:
+        tfidf_cos = 0.0
+    return np.array([ohe_cos, char_ov, freq, tfidf_cos], dtype=np.float32)
+
+
+def _sample_negative_distractors(article: str, gold_options: list[str],
+                                  k: int = 3) -> list[str]:
+    """Mine k random content n-grams from the article that are not in gold_options."""
+    tokens = re.findall(r"[A-Za-z]{3,}", str(article))
+    gold_lc = {str(g).lower().strip() for g in gold_options}
+    negatives, seen = [], set()
+    rng = np.random.default_rng(42)
+    for _ in range(60):
+        if len(tokens) < 2:
+            break
+        n = int(rng.integers(1, 3 + 1))
+        if len(tokens) < n:
+            continue
+        i = int(rng.integers(0, len(tokens) - n + 1))
+        phrase = " ".join(tokens[i: i + n])
+        p_lc = phrase.lower().strip()
+        if not p_lc or p_lc in gold_lc or p_lc in seen:
+            continue
+        if any(t.lower() in STOPWORDS for t in phrase.split()):
+            continue
+        seen.add(p_lc)
+        negatives.append(phrase)
+        if len(negatives) >= k:
+            break
+    return negatives
+
+
+def train_distractor_ranker(train_df: pd.DataFrame, ohe_vec, tfidf_vec=None,
+                             save_path: Path = DISTRACTOR_RANKER_PATH,
+                             max_rows: int = 4000) -> LogisticRegression:
+    """Train LR to distinguish real RACE distractors from random article n-grams."""
+    log.info("Training distractor ranker on up to %d rows ...", max_rows)
+    rows = train_df.sample(min(max_rows, len(train_df)),
+                            random_state=42).reset_index(drop=True)
+
+    X_list: list[np.ndarray] = []
+    y_list: list[int] = []
+    for _, r in rows.iterrows():
+        article = str(r.get("article", ""))
+        if not article.strip():
+            continue
+        correct_label = str(r.get("answer", "")).strip().upper()
+        if correct_label not in ("A", "B", "C", "D"):
+            continue
+        correct_answer = str(r.get(correct_label, "")).strip()
+        if not correct_answer:
+            continue
+        wrong_labels = [c for c in ("A", "B", "C", "D") if c != correct_label]
+        gold_distractors = [str(r.get(c, "")).strip() for c in wrong_labels
+                            if str(r.get(c, "")).strip()]
+        if not gold_distractors:
+            continue
+        # Positives: real RACE distractors written by exam authors.
+        for d in gold_distractors:
+            X_list.append(_distractor_features(d, correct_answer, article,
+                                                ohe_vec, tfidf_vec))
+            y_list.append(1)
+        # Negatives: random article n-grams that are not any RACE option.
+        all_options = gold_distractors + [correct_answer]
+        for neg in _sample_negative_distractors(article, all_options,
+                                                 k=len(gold_distractors)):
+            X_list.append(_distractor_features(neg, correct_answer, article,
+                                                ohe_vec, tfidf_vec))
+            y_list.append(0)
+
+    if not X_list:
+        log.warning("No training data collected for distractor ranker; skipping.")
+        return None  # type: ignore[return-value]
+
+    X = np.vstack(X_list)
+    y = np.array(y_list, dtype=np.int8)
+    log.info("Distractor ranker training set: %d positives / %d negatives",
+             int((y == 1).sum()), int((y == 0).sum()))
+
+    clf = LogisticRegression(class_weight="balanced", max_iter=1000,
+                              solver="liblinear", random_state=42)
+    clf.fit(X, y)
+
+    train_acc = float(clf.score(X, y))
+    log.info("Distractor ranker train accuracy: %.4f", train_acc)
+    log.info("Distractor ranker coefficients (%s): %s",
+             DISTRACTOR_FEATURE_NAMES,
+             [round(float(c), 4) for c in clf.coef_.ravel().tolist()])
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(clf, save_path)
+    log.info("Distractor ranker saved -> %s", save_path)
+    return clf
+
+
+_DISTRACTOR_RANKER = None
+_TFIDF_VEC = None
+
+
+def _load_distractor_ranker():
+    global _DISTRACTOR_RANKER
+    if _DISTRACTOR_RANKER is not None:
+        return _DISTRACTOR_RANKER
+    if not DISTRACTOR_RANKER_PATH.exists():
+        return None
+    _DISTRACTOR_RANKER = joblib.load(DISTRACTOR_RANKER_PATH)
+    return _DISTRACTOR_RANKER
+
+
+def _load_tfidf_vectorizer():
+    global _TFIDF_VEC
+    if _TFIDF_VEC is not None:
+        return _TFIDF_VEC
+    if not TFIDF_PATH.exists():
+        return None
+    _TFIDF_VEC = joblib.load(TFIDF_PATH)
+    return _TFIDF_VEC
+
+
+def score_distractor_candidates(candidates: list[str], correct_answer: str,
+                                  article: str, ohe_vec) -> np.ndarray:
+    """Return per-candidate ranker scores in [0, 1]. Falls back to cosine
+    similarity to the answer if the trained ranker is not available."""
+    if not candidates:
+        return np.array([], dtype=np.float32)
+    ranker = _load_distractor_ranker()
+    if ranker is None:
+        return _cosine(candidates, [correct_answer], ohe_vec).ravel()
+    tfidf_vec = _load_tfidf_vectorizer()
+    X = np.vstack([_distractor_features(c, correct_answer, article,
+                                          ohe_vec, tfidf_vec) for c in candidates])
+    return ranker.predict_proba(X)[:, 1].astype(np.float32)
+
+
+# Rubric 5.3 / 5.4: merge candidate pools, filter, then rank with the trained
+# LR ranker and apply MMR for a diverse final set of three distractors.
 
 def generate_distractors(article: str, question: str, correct_answer: str,
                           vectorizer=None, w2v_model=None,
@@ -617,10 +800,12 @@ def generate_distractors(article: str, question: str, correct_answer: str,
     if not cleaned:
         return []
 
-    # Diversity-filtered top-n via MMR over cleaned pool
-    sim_to_ans = _cosine(cleaned, [correct_answer], vectorizer).ravel()
+    # Score with the trained LR ranker (falls back to OHE cosine if missing),
+    # then run MMR over the cleaned pool to enforce diversity.
+    ranker_scores = score_distractor_candidates(cleaned, correct_answer,
+                                                  article, vectorizer)
     inter = _cosine(cleaned, cleaned, vectorizer)
-    idx = _mmr_select(sim_to_ans, inter, n)
+    idx = _mmr_select(ranker_scores, inter, n)
     selected = [cleaned[i] for i in idx]
 
     # Pad up to n if fewer
@@ -810,6 +995,11 @@ def main():
 
     train_hint_scorer(train_df, vectorizer, save_path=HINT_SCORER_PATH,
                        max_rows=args.max_rows)
+
+    tfidf_vec = _load_tfidf_vectorizer()
+    train_distractor_ranker(train_df, vectorizer, tfidf_vec=tfidf_vec,
+                             save_path=DISTRACTOR_RANKER_PATH,
+                             max_rows=args.max_rows)
 
     if not args.skip_w2v:
         load_word2vec()  # warm cache
