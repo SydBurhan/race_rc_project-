@@ -42,7 +42,7 @@ MODEL_A_TRAD = ROOT / "models" / "model_a" / "traditional"
 OHE_PATH = MODEL_A_TRAD / "ohe_vectorizer.pkl"
 RANKER_PATH = MODEL_A_TRAD / "question_ranker.pkl"
 
-WH_WORDS = ("what", "who", "where", "when", "why")
+WH_WORDS = ("what", "who", "where", "when", "why", "how")
 STOPWORDS_LEAD = {
     "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "as", "is", "was", "are", "were", "be",
@@ -51,41 +51,86 @@ STOPWORDS_LEAD = {
 
 TEMPLATES = {
     "What": [
-        "What {verb_phrase} in the passage?",
-        "What does the author say about {noun_phrase}?",
+        "What is {noun_phrase} according to the passage?",
+        "What does the passage say about {noun_phrase}?",
         "What is the main idea related to {noun_phrase}?",
-        "What happened when {clause}?",
         "What is meant by {noun_phrase} in the passage?",
+        "What is described as {adj_phrase} in the passage?",
     ],
     "Who": [
-        "Who {verb_phrase} according to the passage?",
+        "Who is {noun_phrase} according to the passage?",
         "Who is responsible for {noun_phrase}?",
-        "Who does the passage say {clause}?",
-        "Who mentioned {noun_phrase}?",
+        "Who is associated with {noun_phrase} in the passage?",
+        "Who is mentioned in connection with {noun_phrase}?",
         "Who is described as {adj_phrase} in the passage?",
     ],
     "Where": [
-        "Where did {clause}?",
-        "Where is {noun_phrase} mentioned?",
-        "Where does {noun_phrase} take place?",
-        "Where was {noun_phrase} according to the author?",
-        "Where can {noun_phrase} be found based on the passage?",
+        "Where is {noun_phrase} located according to the passage?",
+        "Where is {noun_phrase} mentioned in the text?",
+        "Where can {noun_phrase} be found according to the passage?",
+        "Where does the passage say {noun_phrase} is?",
+        "Where is {noun_phrase} situated?",
     ],
     "When": [
-        "When did {clause}?",
-        "When is {noun_phrase} mentioned in the passage?",
-        "When does {noun_phrase} occur according to the text?",
-        "When was {noun_phrase} first described?",
-        "When does the author suggest {clause}?",
+        "When did the events involving {noun_phrase} take place?",
+        "When was {noun_phrase} first mentioned?",
+        "In what year is {noun_phrase} described?",
+        "When does the passage say {noun_phrase} occurred?",
+        "When was {noun_phrase} established according to the passage?",
     ],
     "Why": [
-        "Why did {clause}?",
         "Why is {noun_phrase} important according to the passage?",
         "Why does the author mention {noun_phrase}?",
-        "Why was {noun_phrase} significant?",
-        "Why does {clause} according to the text?",
+        "Why was {noun_phrase} considered significant?",
+        "Why is {noun_phrase} described as {adj_phrase}?",
+        "Why is {noun_phrase} relevant to the passage?",
+    ],
+    "How": [
+        "How many {noun_phrase} are mentioned in the passage?",
+        "How long is {noun_phrase} according to the passage?",
+        "How does the passage describe {noun_phrase}?",
+        "How is {noun_phrase} characterized in the text?",
+        "How does {noun_phrase} relate to the main topic?",
     ],
 }
+
+# Allowed Wh-words per answer-type. The picker uses this to avoid producing
+# obviously type-mismatched questions (e.g. "Why" for a numeric answer).
+TYPE_TO_WH = {
+    "number":   ("How", "When", "What"),    # 1,500 / 2,300 / 1981
+    "year":     ("When", "What"),           # 1981
+    "person":   ("Who", "What"),            # capitalized single name
+    "place":    ("Where", "What"),          # location-like proper noun
+    "entity":   ("What", "Why", "How"),     # multi-word proper noun
+    "phrase":   ("What", "Why", "How"),     # generic noun phrase
+}
+
+
+def _classify_answer(answer: str) -> str:
+    """Coarse answer-type classifier used to gate template selection."""
+    a = str(answer).strip()
+    if not a:
+        return "phrase"
+    # Year: 4 digits
+    if re.fullmatch(r"\d{3,4}", a):
+        return "year"
+    # Any other number (with commas / decimals / units like "300 kilometers")
+    if re.search(r"\b\d[\d,\.]*\b", a):
+        return "number"
+    tokens = a.split()
+    cap_tokens = [t for t in tokens if t and t[0].isupper()]
+    if not cap_tokens:
+        return "phrase"
+    # Heuristic place keywords
+    place_kw = {"reef", "ocean", "sea", "city", "country", "river", "mountain",
+                "island", "forest", "park", "lake", "bay", "coast", "australia",
+                "america", "europe", "asia", "africa"}
+    if any(t.lower() in place_kw for t in tokens):
+        return "place"
+    # Single capitalized token → could be person or entity name
+    if len(tokens) == 1:
+        return "entity"
+    return "entity"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,13 +177,25 @@ _ADJ_RE = re.compile(r"\b\w+(?:ing|ed|ful|ous|al)\b", re.IGNORECASE)
 
 def fill_template(template: str, sentence: str, answer: str) -> str:
     """Substitute {noun_phrase}, {verb_phrase}, {clause}, {adj_phrase} with passage content."""
-    # Noun phrase: longest run of capitalized tokens, fallback to first 3 answer words
-    matches = _NOUN_PHRASE_RE.findall(sentence)
-    if matches:
-        noun_phrase = max(matches, key=len)
+    # Noun phrase: prefer the answer itself if it looks like a noun phrase
+    # (proper noun, multi-word capitalized, or numeric quantity). Otherwise
+    # use the longest run of capitalized tokens in the source sentence.
+    answer_clean = str(answer).strip().rstrip(".,;:!?")
+    looks_like_np = (
+        bool(answer_clean)
+        and (answer_clean[0].isupper()
+             or any(c.isdigit() for c in answer_clean))
+        and len(answer_clean.split()) <= 5
+    )
+    if looks_like_np:
+        noun_phrase = answer_clean
     else:
-        ans_words = str(answer).split()
-        noun_phrase = " ".join(ans_words[:3]) if ans_words else "this topic"
+        matches = _NOUN_PHRASE_RE.findall(sentence)
+        if matches:
+            noun_phrase = max(matches, key=len)
+        else:
+            ans_words = answer_clean.split()
+            noun_phrase = " ".join(ans_words[:3]) if ans_words else "this topic"
 
     tokens = sentence.split()
 
@@ -167,12 +224,19 @@ def fill_template(template: str, sentence: str, answer: str) -> str:
 
 def generate_questions(article: str, correct_answer: str, vectorizer,
                        n: int = 5) -> list[dict]:
-    """Generate up to 5 Wh templates × n top sentences = ~5n candidate questions."""
+    """
+    Generate candidate questions across the top-n source sentences.
+    Templates are filtered by answer type so numeric answers don't produce
+    "Who/Where/Why" questions, etc.
+    """
     candidates = extract_candidate_sentences(article, correct_answer, vectorizer, top_k=n)
+    answer_type = _classify_answer(correct_answer)
+    allowed_wh = TYPE_TO_WH.get(answer_type, tuple(TEMPLATES.keys()))
+
     out = []
     for sent, sim, pos in candidates:
-        for wh, templates in TEMPLATES.items():
-            for tpl in templates:
+        for wh in allowed_wh:
+            for tpl in TEMPLATES.get(wh, []):
                 q = fill_template(tpl, sent, correct_answer)
                 out.append({
                     "question": q,
@@ -180,6 +244,7 @@ def generate_questions(article: str, correct_answer: str, vectorizer,
                     "wh_word": wh.lower(),
                     "sentence_similarity": sim,
                     "sentence_position": pos,
+                    "answer_type": answer_type,
                 })
     return out
 

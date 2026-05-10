@@ -89,19 +89,81 @@ def _cosine(texts_a: list[str], texts_b: list[str], vectorizer) -> np.ndarray:
 
 # ── Answer-type detection (for distractor plausibility filters) ───────────────
 _NUM_RE = re.compile(r"^\s*-?\d[\d,.\s]*\s*$")
-_YEAR_RE = re.compile(r"^\s*(19|20)\d{2}\s*$")
+_YEAR_RE = re.compile(r"^\s*\d{3,4}\s*$")
+# Number followed by an optional unit / noun (e.g. "6,650 kilometers", "37 trillion cells")
+_NUM_PHRASE_RE = re.compile(r"^\s*(?P<num>\d[\d,\.]*)\s*(?P<unit>[A-Za-z][A-Za-z\s]*)?\s*$")
 
 
 def _answer_type(answer: str) -> str:
-    """Return one of: 'year', 'number', 'short' (1-2 words), 'phrase'."""
+    """Return one of: 'year', 'number', 'num_phrase', 'short' (1-2 words), 'phrase'."""
     a = str(answer).strip()
     if _YEAR_RE.match(a):
         return "year"
     if _NUM_RE.match(a):
         return "number"
+    if _NUM_PHRASE_RE.match(a) and any(c.isalpha() for c in a):
+        return "num_phrase"
     if 1 <= len(a.split()) <= 2:
         return "short"
     return "phrase"
+
+
+def _synthesize_numeric_distractors(answer: str, n: int = 5) -> list[str]:
+    """
+    Generate plausible numeric distractors by perturbing the gold answer.
+    Handles three forms:
+      - bare year   ("1636")            → nearby years  (±5, ±15, ±50, ±150, ±300)
+      - bare number ("37000")           → ±10%, ±25%, ±50% rounded
+      - num+unit    ("6,650 kilometers")→ same perturbations, unit preserved
+    """
+    a = str(answer).strip()
+    m = _NUM_PHRASE_RE.match(a)
+    if not m:
+        return []
+    raw_num = m.group("num").replace(",", "")
+    unit = (m.group("unit") or "").strip()
+
+    try:
+        base = float(raw_num)
+    except ValueError:
+        return []
+    is_year = _YEAR_RE.match(a) is not None
+
+    if is_year:
+        base = int(base)
+        offsets = [-5, +15, -50, +150, -300, +500]
+        cands = [base + d for d in offsets if 1000 <= base + d <= 2099]
+        return [str(int(c)) for c in cands][:n]
+
+    # Generic numeric perturbations
+    is_int = base.is_integer()
+    factors = [0.5, 0.75, 1.25, 1.5, 2.0, 0.25]
+    cands_num = []
+    for f in factors:
+        v = base * f
+        if is_int:
+            # Round to a "nice" magnitude based on size
+            if v >= 1000:
+                v = round(v, -2)        # round to hundreds
+            elif v >= 100:
+                v = round(v, -1)        # round to tens
+            else:
+                v = round(v)
+            cands_num.append(int(v))
+        else:
+            cands_num.append(round(v, 2))
+
+    out: list[str] = []
+    seen = {raw_num}
+    for v in cands_num:
+        s = f"{v:,}" if isinstance(v, int) and v >= 1000 else str(v)
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(f"{s} {unit}".strip())
+        if len(out) >= n:
+            break
+    return out
 
 
 def _length_ok(candidate: str, answer: str, ratio: float = 2.0) -> bool:
@@ -111,13 +173,44 @@ def _length_ok(candidate: str, answer: str, ratio: float = 2.0) -> bool:
     return (1.0 / ratio) <= (nc / na) <= ratio
 
 
+def _content_words(text: str) -> set[str]:
+    """Lowercase content tokens minus stop-words — for overlap checks."""
+    return {w for w in _tokenise(text) if w not in STOPWORDS}
+
+
+def _too_overlapping(candidate: str, answer: str, max_jaccard: float = 0.34) -> bool:
+    """
+    True if the candidate shares too many content words with the answer.
+    Prevents distractors like "the northeastern region" when the answer is
+    "northeastern region of Tanzania".
+    """
+    a = _content_words(answer)
+    c = _content_words(candidate)
+    if not a or not c:
+        return False
+    inter = a & c
+    if not inter:
+        return False
+    union = a | c
+    jaccard = len(inter) / len(union)
+    if jaccard > max_jaccard:
+        return True
+    # Also reject if the candidate is essentially a subset of the answer's
+    # content words (covers "the northeastern", "tanzania rises", etc.).
+    if len(c) <= len(a) and len(inter) / len(c) >= 0.6:
+        return True
+    return False
+
+
 def _matches_type(candidate: str, atype: str) -> bool:
-    """Filter candidates by the answer's type (year / number / phrase)."""
+    """Filter candidates by the answer's type (year / number / num_phrase / phrase)."""
     c = str(candidate).strip()
     if atype == "year":
         return bool(_YEAR_RE.match(c))
     if atype == "number":
         return bool(_NUM_RE.match(c))
+    if atype == "num_phrase":
+        return bool(_NUM_PHRASE_RE.match(c) and any(ch.isdigit() for ch in c))
     # 'short' and 'phrase' accept anything non-numeric
     return not _NUM_RE.match(c)
 
@@ -265,6 +358,156 @@ def load_word2vec():
         return None
 
 
+# Offline peer-entity lexicon used when Word2Vec is unavailable. Each list is
+# kept short and homogeneous so that substituting any peer back into the
+# answer phrase yields a plausible, type-matched distractor.
+_PEER_LEXICON: dict[str, list[str]] = {
+    # African countries (East Africa cluster + a few neighbours)
+    "tanzania": ["Kenya", "Uganda", "Ethiopia", "Rwanda", "Mozambique", "Zambia"],
+    "kenya":    ["Tanzania", "Uganda", "Ethiopia", "Somalia", "Sudan"],
+    "uganda":   ["Kenya", "Tanzania", "Rwanda", "Burundi"],
+    "ethiopia": ["Kenya", "Sudan", "Eritrea", "Somalia"],
+    "egypt":    ["Libya", "Sudan", "Jordan", "Morocco"],
+    "morocco":  ["Algeria", "Tunisia", "Egypt", "Libya"],
+    # Other countries
+    "australia":   ["New Zealand", "Indonesia", "Malaysia", "Philippines"],
+    "japan":       ["China", "Korea", "Vietnam", "Thailand"],
+    "china":       ["Japan", "India", "Vietnam", "Mongolia"],
+    "india":       ["Pakistan", "Bangladesh", "Nepal", "Sri Lanka"],
+    "france":      ["Germany", "Spain", "Italy", "Belgium"],
+    "germany":     ["France", "Austria", "Poland", "Netherlands"],
+    "italy":       ["Spain", "France", "Greece", "Portugal"],
+    "spain":       ["Portugal", "Italy", "France", "Greece"],
+    "england":     ["Scotland", "Wales", "Ireland", "France"],
+    "russia":      ["Ukraine", "Belarus", "Poland", "Kazakhstan"],
+    "brazil":      ["Argentina", "Chile", "Peru", "Colombia"],
+    "mexico":      ["Guatemala", "Honduras", "Cuba", "Belize"],
+    "canada":      ["Mexico", "Greenland", "Alaska", "Iceland"],
+    # Continents
+    "africa":          ["Asia", "Europe", "South America", "Oceania"],
+    "asia":            ["Africa", "Europe", "South America", "Oceania"],
+    "europe":          ["Asia", "Africa", "North America", "Oceania"],
+    # Cardinal directions
+    "northeastern":    ["southeastern", "northwestern", "southwestern", "central"],
+    "southeastern":    ["northeastern", "southwestern", "northwestern", "central"],
+    "northwestern":    ["southwestern", "northeastern", "southeastern", "central"],
+    "southwestern":    ["northwestern", "southeastern", "northeastern", "central"],
+    "northern":        ["southern", "eastern", "western", "central"],
+    "southern":        ["northern", "eastern", "western", "central"],
+    "eastern":         ["western", "northern", "southern", "central"],
+    "western":         ["eastern", "northern", "southern", "central"],
+    # Common geographic head nouns
+    "ocean":           ["sea", "lake", "bay", "gulf"],
+    "sea":             ["ocean", "lake", "bay", "gulf"],
+    "river":           ["stream", "lake", "creek", "canal"],
+    "mountain":        ["hill", "peak", "ridge", "plateau"],
+    "forest":          ["jungle", "woodland", "grassland", "savanna"],
+    "desert":          ["plateau", "savanna", "tundra", "steppe"],
+    # Common entities
+    "harvard":         ["Yale", "Princeton", "Stanford", "Oxford"],
+    "yale":            ["Harvard", "Princeton", "Columbia", "Cornell"],
+    "oxford":          ["Cambridge", "Harvard", "Yale", "Edinburgh"],
+    "cambridge":       ["Oxford", "Harvard", "Yale", "Edinburgh"],
+    "nile":            ["Amazon", "Yangtze", "Mississippi", "Ganges"],
+    "amazon":          ["Nile", "Congo", "Mississippi", "Mekong"],
+    "kilimanjaro":     ["Everest", "Denali", "Aconcagua", "Elbrus"],
+    "everest":         ["Kilimanjaro", "Denali", "Aconcagua", "K2"],
+}
+
+
+def _peer_substitutes(head: str, k: int = 5) -> list[str]:
+    """Lookup peers from the offline lexicon (case-insensitive)."""
+    return list(_PEER_LEXICON.get(head.lower(), []))[:k]
+
+
+def _w2v_peers(token: str, w2v_model, k: int = 6) -> list[str]:
+    """Return up to k W2V neighbours of token, or [] if unavailable."""
+    if w2v_model is None:
+        return []
+    key = None
+    try:
+        if token in w2v_model:
+            key = token
+        elif token.lower() in w2v_model:
+            key = token.lower()
+    except Exception:
+        return []
+    if key is None:
+        return []
+    try:
+        out = []
+        for word, _ in w2v_model.most_similar(key, topn=k * 3):
+            cand = word.replace("_", " ").strip()
+            if not cand or cand.lower() == token.lower():
+                continue
+            out.append(cand)
+            if len(out) >= k:
+                break
+        return out
+    except KeyError:
+        return []
+
+
+def _substitute_proper_noun_distractors(answer: str, w2v_model,
+                                         n: int = 5) -> list[str]:
+    """
+    Build length-matched distractors by swapping one salient token of the
+    answer phrase with peers from (a) the offline lexicon, then (b) Word2Vec.
+
+    Tries every substitutable token (right-most first), so a phrase like
+    "northeastern region of Tanzania" yields peers for both 'Tanzania'
+    (Kenya, Uganda, ...) and 'northeastern' (southeastern, central, ...).
+    """
+    tokens = str(answer).split()
+    if len(tokens) < 2:
+        return []
+
+    # Identify substitutable token indices: prefer right-most proper nouns,
+    # then any non-stopword cardinal-direction-like token.
+    sub_indices: list[int] = []
+    for i in range(len(tokens) - 1, -1, -1):
+        clean = tokens[i].strip(".,;:!?\"'")
+        if not clean:
+            continue
+        head_lc = clean.lower()
+        if head_lc in STOPWORDS:
+            continue
+        # Substitutable if (a) capitalized proper noun, or (b) listed in lexicon.
+        if clean[0].isupper() or head_lc in _PEER_LEXICON:
+            sub_indices.append(i)
+
+    if not sub_indices:
+        return []
+
+    out: list[str] = []
+    seen_phrases: set[str] = {answer.lower().strip()}
+
+    for idx in sub_indices:
+        head = tokens[idx].strip(".,;:!?\"'")
+        peers = _peer_substitutes(head, k=n + 2)
+        if not peers:
+            peers = _w2v_peers(head, w2v_model, k=n + 2)
+
+        for peer in peers:
+            if not peer or peer.lower() == head.lower():
+                continue
+            new_tokens = list(tokens)
+            # Preserve original case-pattern: if head was lowercase, keep peer lower
+            if head[0].islower() and peer[0].isupper():
+                new_tokens[idx] = peer.lower()
+            else:
+                new_tokens[idx] = peer
+            phrase = " ".join(new_tokens)
+            key = phrase.lower().strip()
+            if key in seen_phrases:
+                continue
+            seen_phrases.add(key)
+            out.append(phrase)
+            if len(out) >= n:
+                return out
+    return out
+
+
 def get_word2vec_distractors(correct_answer: str, article: str,
                               w2v_model, top_n: int = 10) -> list[str]:
     if w2v_model is None:
@@ -311,16 +554,42 @@ def generate_distractors(article: str, question: str, correct_answer: str,
     if vectorizer is None:
         vectorizer = load_vectorizer()
 
-    pool: list[str] = []
-    pool.extend(_tfidf_mmr_distractors(article, correct_answer, vectorizer, n=n + 2))
-    pool.extend(frequency_substitution_distractors(article, correct_answer, top_n=n + 2))
-    pool.extend(get_word2vec_distractors(correct_answer, article, w2v_model, top_n=10))
+    atype = _answer_type(correct_answer)
+
+    # Two pools: TRUSTED (synthesized / substituted — bypass overlap & length
+    # filters because they are deliberately constructed to be type-matched)
+    # and UNTRUSTED (extracted from article — must pass all plausibility checks).
+    trusted: list[str] = []
+    untrusted: list[str] = []
+
+    if atype in ("year", "number", "num_phrase"):
+        trusted.extend(_synthesize_numeric_distractors(correct_answer, n=n + 3))
+    if atype in ("phrase", "short", "num_phrase"):
+        trusted.extend(_substitute_proper_noun_distractors(correct_answer, w2v_model,
+                                                            n=n + 3))
+
+    untrusted.extend(_tfidf_mmr_distractors(article, correct_answer, vectorizer, n=n + 2))
+    untrusted.extend(frequency_substitution_distractors(article, correct_answer, top_n=n + 2))
+    untrusted.extend(get_word2vec_distractors(correct_answer, article, w2v_model, top_n=10))
 
     correct_lc = str(correct_answer).lower().strip()
-    atype = _answer_type(correct_answer)
     seen: set[str] = set()
     cleaned: list[str] = []
-    for cand in pool:
+
+    # Trusted pass: only dedupe + type sanity check
+    for cand in trusted:
+        if not cand:
+            continue
+        c_lc = cand.lower().strip()
+        if not c_lc or c_lc == correct_lc or c_lc in seen:
+            continue
+        if not _matches_type(cand, atype):
+            continue
+        seen.add(c_lc)
+        cleaned.append(cand)
+
+    # Untrusted pass: full plausibility filters
+    for cand in untrusted:
         if not cand:
             continue
         c_lc = cand.lower().strip()
@@ -330,16 +599,21 @@ def generate_distractors(article: str, question: str, correct_answer: str,
             continue
         if c_lc in seen:
             continue
-        # Plausibility filters: type + length
         if not _matches_type(cand, atype):
             continue
         if not _length_ok(cand, correct_answer):
             continue
+        if _too_overlapping(cand, correct_answer):
+            continue
         seen.add(c_lc)
         cleaned.append(cand)
 
+    # All-pool fallback used only if we still don't have enough
+    pool = trusted + untrusted
+
     # If filters were too aggressive (e.g. for 'year' types where the article
-    # has few year-like tokens), retry with type-only / no length constraint.
+    # has few year-like tokens), retry without the length constraint — but
+    # KEEP the overlap filter so we never produce near-duplicate distractors.
     if len(cleaned) < n:
         for cand in pool:
             if not cand:
@@ -347,6 +621,8 @@ def generate_distractors(article: str, question: str, correct_answer: str,
             c_lc = cand.lower().strip()
             if (not c_lc or c_lc == correct_lc or c_lc in seen
                     or c_lc in correct_lc or correct_lc in c_lc):
+                continue
+            if _too_overlapping(cand, correct_answer):
                 continue
             seen.add(c_lc)
             cleaned.append(cand)
