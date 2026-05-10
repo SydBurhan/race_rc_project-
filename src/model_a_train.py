@@ -68,11 +68,10 @@ LR_PARAMS = dict(C=1.0, max_iter=1000, solver="liblinear",
 SVM_PARAMS = dict(C=0.1, max_iter=4000, random_state=42, class_weight="balanced", dual="auto")
 NB_PARAMS = dict(alpha=0.3)
 # RF on sparse 15k-feature data is expensive; keep modest defaults.
-# max_features=0.05 → ~750 cols/split (vs sqrt=122). With 10 lexical features,
-# this raises the probability a split-candidate set contains at least one
-# engineered feature from ~8% to ~39% — letting the strong lexical signal
-# influence a much larger fraction of nodes.
-RF_PARAMS = dict(n_estimators=150, max_depth=24, max_features=0.05,
+# Balanced config: 120 trees, sqrt feature sampling (~122 cols/split).
+# The previous bump to max_features=0.05 was 6x slower for ~0.01 F1 gain.
+# Lexical features already dominate top importances at sqrt — no need to force them.
+RF_PARAMS = dict(n_estimators=120, max_depth=24, max_features="sqrt",
                  min_samples_leaf=2, class_weight="balanced",
                  random_state=42, n_jobs=-1)
 def _detect_xgb_device() -> str:
