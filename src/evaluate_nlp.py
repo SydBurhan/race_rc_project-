@@ -31,6 +31,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
+# Make `from src.inference import ...` work when this file is launched directly.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 PROCESSED_DIR = ROOT / "data" / "processed"
 REPORTS_DIR = ROOT / "reports"
 METRICS_PATH = REPORTS_DIR / "metrics_test.json"

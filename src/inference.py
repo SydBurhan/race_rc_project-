@@ -126,14 +126,15 @@ def predict_answer(article: str, question: str, options: dict) -> tuple[str, flo
         best = max(scores, key=scores.get)
         return best, scores[best]
 
+    from scipy.special import expit
     lr, svm, nb = ensemble
     vec = _load_ohe()
     scores = {}
     for label, text in options.items():
         X = _featurise_option(article, question, str(text), vec)
-        p = (lr.predict_proba(X)[0, 1]
-             + svm.predict_proba(X)[0, 1]
-             + nb.predict_proba(X)[0, 1]) / 3.0
+        # SVM has no predict_proba; sigmoid of decision_function is monotonic.
+        p_svm = float(expit(svm.decision_function(X))[0])
+        p = (lr.predict_proba(X)[0, 1] + p_svm + nb.predict_proba(X)[0, 1]) / 3.0
         scores[label] = float(p)
     best = max(scores, key=scores.get)
     return best, scores[best]

@@ -32,7 +32,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -66,7 +65,7 @@ RESULTS_PATH = MODEL_A_TRAD / "training_results.json"
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
 LR_PARAMS = dict(C=1.0, max_iter=1000, solver="liblinear",
                  random_state=42, class_weight="balanced")
-SVM_PARAMS = dict(C=0.05, max_iter=3000, random_state=42, class_weight="balanced")
+SVM_PARAMS = dict(C=0.1, max_iter=4000, random_state=42, class_weight="balanced", dual="auto")
 NB_PARAMS = dict(alpha=0.3)
 # RF on sparse 15k-feature data is expensive; keep modest defaults.
 RF_PARAMS = dict(n_estimators=80, max_depth=24, max_features="sqrt",
@@ -87,9 +86,13 @@ def _detect_xgb_device() -> str:
 
 
 # XGBoost: hist + GPU when available (5-10x speedup on Colab/Kaggle).
+# Shallow trees + L2 regularisation prevent overfitting to spurious vocab terms.
 _XGB_DEVICE = _detect_xgb_device()
-XGB_PARAMS = dict(n_estimators=150, max_depth=6, tree_method="hist",
-                  device=_XGB_DEVICE, learning_rate=0.1,
+XGB_PARAMS = dict(n_estimators=200, max_depth=4, tree_method="hist",
+                  device=_XGB_DEVICE, learning_rate=0.08,
+                  reg_lambda=1.0, reg_alpha=0.1, subsample=0.8,
+                  colsample_bytree=0.6, min_child_weight=10,
+                  scale_pos_weight=3.0,  # class imbalance: 3 distractors : 1 correct
                   eval_metric="logloss", random_state=42, n_jobs=-1)
 KM_PARAMS = dict(n_clusters=4, n_init=10, random_state=42)
 LP_PARAMS = dict(kernel="knn", n_neighbors=7, max_iter=1000)
@@ -160,11 +163,10 @@ def train_supervised(X_tr, y_tr, X_va, y_va, vocab_size: int) -> tuple[dict, dic
     joblib.dump(lr, MODEL_A_TRAD / "lr.pkl")
     models["lr"] = lr
 
-    log.info("Training calibrated LinearSVC ...")
-    svm_base = LinearSVC(**SVM_PARAMS)
-    svm = CalibratedClassifierCV(svm_base, cv=3)
+    log.info("Training LinearSVC (raw, no Platt scaling) ...")
+    svm = LinearSVC(**SVM_PARAMS)
     svm.fit(X_tr, y_tr)
-    metrics["SVM"] = _report("SVM (calibrated)", svm, X_va, y_va)
+    metrics["SVM"] = _report("SVM (LinearSVC)", svm, X_va, y_va)
     joblib.dump(svm, MODEL_A_TRAD / "svm.pkl")
     models["svm"] = svm
 
@@ -200,8 +202,11 @@ def train_supervised(X_tr, y_tr, X_va, y_va, vocab_size: int) -> tuple[dict, dic
 
 def train_ensemble(models: dict, X_va, y_va) -> dict:
     log.info("Building soft-vote ensemble (LR + SVM + NB) ...")
+    from scipy.special import expit
     p_lr = models["lr"].predict_proba(X_va)[:, 1]
-    p_svm = models["svm"].predict_proba(X_va)[:, 1]
+    # LinearSVC has no predict_proba; sigmoid of decision_function is a sound
+    # monotonic surrogate for soft-voting purposes.
+    p_svm = expit(models["svm"].decision_function(X_va))
     p_nb = models["nb"].predict_proba(X_va)[:, 1]
     avg = (p_lr + p_svm + p_nb) / 3.0
     y_pred = (avg >= 0.5).astype(int)
