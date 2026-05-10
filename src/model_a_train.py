@@ -88,11 +88,10 @@ def _detect_xgb_device() -> str:
 # XGBoost: hist + GPU when available (5-10x speedup on Colab/Kaggle).
 # Shallow trees + L2 regularisation prevent overfitting to spurious vocab terms.
 _XGB_DEVICE = _detect_xgb_device()
-XGB_PARAMS = dict(n_estimators=200, max_depth=4, tree_method="hist",
+XGB_PARAMS = dict(n_estimators=300, max_depth=5, tree_method="hist",
                   device=_XGB_DEVICE, learning_rate=0.08,
                   reg_lambda=1.0, reg_alpha=0.1, subsample=0.8,
-                  colsample_bytree=0.6, min_child_weight=10,
-                  scale_pos_weight=3.0,  # class imbalance: 3 distractors : 1 correct
+                  colsample_bytree=0.6, min_child_weight=8,
                   eval_metric="logloss", random_state=42, n_jobs=-1)
 KM_PARAMS = dict(n_clusters=4, n_init=10, random_state=42)
 LP_PARAMS = dict(kernel="knn", n_neighbors=7, max_iter=1000)
@@ -143,7 +142,9 @@ def _print_top_features(name: str, importances: np.ndarray, vocab_size: int,
         else:
             # Lexical features tail
             lex_names = ["article_len", "question_len", "option_len",
-                          "keyword_overlap", "answer_in_article", "option_position"]
+                          "keyword_overlap", "answer_in_article", "option_position",
+                          "q_opt_overlap", "opt_uniqueness",
+                          "opt_other_overlap", "opt_article_cos"]
             term = lex_names[i - vocab_size] if (i - vocab_size) < len(lex_names) else f"<idx-{i}>"
         print(f"    {term:<28}  {importances[i]:.4f}")
 

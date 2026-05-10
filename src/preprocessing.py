@@ -258,22 +258,77 @@ def build_ohe_features(train_df, val_df, test_df):
 
 def build_lexical_features(expanded_df: pd.DataFrame) -> np.ndarray:
     """
-    Returns a (n_rows, 6) dense float array:
-       article_len, question_len, option_len,
-       keyword_overlap, answer_in_article, option_position
+    Returns a (n_rows, 10) dense float array. Rows arrive in groups of 4
+    (one per option of the same question).
+
+    Indices and meanings (kept in sync with model_a_train._print_top_features):
+       0 article_len         number of tokens in the article
+       1 question_len        number of tokens in the question
+       2 option_len          number of tokens in this option
+       3 keyword_overlap     count of option tokens also present in article
+       4 answer_in_article   1.0 if option text is a substring of article
+       5 option_position     option index 0..3
+       6 q_opt_overlap       Jaccard(question tokens, option tokens)
+       7 opt_uniqueness      option_len / mean option_len across the 4 options
+       8 opt_other_overlap   Jaccard(this option, union of OTHER 3 options)
+       9 opt_article_cos     cosine of option BoW vs article BoW
     """
-    feats = np.zeros((len(expanded_df), 6), dtype=np.float32)
-    for i, r in enumerate(expanded_df.itertuples(index=False)):
-        a_words = str(r.article).split()
-        q_words = str(r.question).split()
-        o_words = str(r.option_text).split()
+    import math
+    from collections import Counter
+
+    n = len(expanded_df)
+    feats = np.zeros((n, 10), dtype=np.float32)
+    rows = list(expanded_df.itertuples(index=False))
+
+    for q_start in range(0, n, 4):
+        group = rows[q_start: q_start + 4]
+        if not group:
+            continue
+
+        article = str(group[0].article)
+        question = str(group[0].question)
+        a_words = article.split()
+        q_words = question.split()
         a_set = set(a_words)
-        feats[i, 0] = len(a_words)
-        feats[i, 1] = len(q_words)
-        feats[i, 2] = len(o_words)
-        feats[i, 3] = sum(1 for w in o_words if w in a_set)
-        feats[i, 4] = 1.0 if str(r.option_text) and str(r.option_text) in str(r.article) else 0.0
-        feats[i, 5] = float(r.option_idx)
+        q_set = set(q_words)
+
+        a_counter = Counter(a_words)
+        a_norm = math.sqrt(sum(c * c for c in a_counter.values())) or 1.0
+
+        opt_word_lists = [str(r.option_text).split() for r in group]
+        opt_word_sets = [set(w) for w in opt_word_lists]
+        opt_lens = [len(w) for w in opt_word_lists]
+        mean_opt_len = max(1.0, sum(opt_lens) / max(1, len(opt_lens)))
+
+        for j, r in enumerate(group):
+            o_words = opt_word_lists[j]
+            o_set = opt_word_sets[j]
+
+            feats[q_start + j, 0] = len(a_words)
+            feats[q_start + j, 1] = len(q_words)
+            feats[q_start + j, 2] = len(o_words)
+            feats[q_start + j, 3] = sum(1 for w in o_words if w in a_set)
+            feats[q_start + j, 4] = 1.0 if r.option_text and str(r.option_text) in article else 0.0
+            feats[q_start + j, 5] = float(r.option_idx)
+
+            # 6 — Jaccard(question, option)
+            union_qo = len(q_set | o_set)
+            feats[q_start + j, 6] = (len(q_set & o_set) / union_qo) if union_qo else 0.0
+
+            # 7 — relative option length within the question
+            feats[q_start + j, 7] = len(o_words) / mean_opt_len
+
+            # 8 — Jaccard with union of other 3 options
+            other = set().union(*[opt_word_sets[k] for k in range(len(group)) if k != j]) if len(group) > 1 else set()
+            union_oo = len(o_set | other)
+            feats[q_start + j, 8] = (len(o_set & other) / union_oo) if union_oo else 0.0
+
+            # 9 — cosine(option BoW, article BoW)
+            o_counter = Counter(o_words)
+            dot = sum(o_counter[w] * a_counter[w] for w in o_counter if w in a_counter)
+            o_norm = math.sqrt(sum(c * c for c in o_counter.values())) or 1.0
+            feats[q_start + j, 9] = dot / (a_norm * o_norm)
+
     return feats
 
 

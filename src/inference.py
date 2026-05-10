@@ -81,23 +81,66 @@ def _clean(text: str) -> str:
     return text
 
 
-def _featurise_option(article: str, question: str, option: str, vectorizer):
-    combined = _clean(article) + " " + _clean(question) + " " + _clean(option)
+def _featurise_option(article: str, question: str, option: str, vectorizer,
+                       option_idx: int = 0, all_options: list[str] | None = None):
+    """
+    Build the same 10-feature vector as preprocessing.build_lexical_features.
+    `all_options` (length 4) lets us compute the per-question relative features.
+    When unavailable (single-option callers), we fall back to neutral defaults.
+    """
+    import math
+    from collections import Counter
+    import scipy.sparse as sp
+
+    art_c = _clean(article)
+    q_c = _clean(question)
+    opt_c = _clean(option)
+    combined = art_c + " " + q_c + " " + opt_c
     X_ohe = vectorizer.transform([combined])
-    # Lexical features (must match preprocessing.build_lexical_features ordering)
-    a_words = _clean(article).split()
-    q_words = _clean(question).split()
-    o_words = _clean(option).split()
+
+    a_words = art_c.split()
+    q_words = q_c.split()
+    o_words = opt_c.split()
     a_set = set(a_words)
+    q_set = set(q_words)
+    o_set = set(o_words)
+
+    a_counter = Counter(a_words)
+    a_norm = math.sqrt(sum(c * c for c in a_counter.values())) or 1.0
+    o_counter = Counter(o_words)
+    o_norm = math.sqrt(sum(c * c for c in o_counter.values())) or 1.0
+    dot = sum(o_counter[w] * a_counter[w] for w in o_counter if w in a_counter)
+    opt_article_cos = dot / (a_norm * o_norm)
+
+    # Per-question relative features need all 4 options
+    if all_options and len(all_options) >= 2:
+        opt_lists = [_clean(o).split() for o in all_options]
+        opt_sets = [set(w) for w in opt_lists]
+        mean_len = max(1.0, sum(len(w) for w in opt_lists) / len(opt_lists))
+        other = set().union(*[opt_sets[k] for k, t in enumerate(all_options)
+                                if _clean(t) != opt_c]) or set()
+        opt_uniqueness = len(o_words) / mean_len
+        union_oo = len(o_set | other)
+        opt_other_overlap = (len(o_set & other) / union_oo) if union_oo else 0.0
+    else:
+        opt_uniqueness = 1.0
+        opt_other_overlap = 0.0
+
+    union_qo = len(q_set | o_set)
+    q_opt_overlap = (len(q_set & o_set) / union_qo) if union_qo else 0.0
+
     lex = np.array([[
         len(a_words),
         len(q_words),
         len(o_words),
         sum(1 for w in o_words if w in a_set),
-        1.0 if option and option in article else 0.0,
-        0.0,  # option_position unknown at single-option time → 0
+        1.0 if opt_c and opt_c in art_c else 0.0,
+        float(option_idx),
+        q_opt_overlap,
+        opt_uniqueness,
+        opt_other_overlap,
+        opt_article_cos,
     ]], dtype=np.float32)
-    import scipy.sparse as sp
     return sp.hstack([X_ohe, sp.csr_matrix(lex)], format="csr")
 
 
@@ -129,9 +172,12 @@ def predict_answer(article: str, question: str, options: dict) -> tuple[str, flo
     from scipy.special import expit
     lr, svm, nb = ensemble
     vec = _load_ohe()
+    labels = list(options.keys())
+    texts = [str(options[l]) for l in labels]
     scores = {}
-    for label, text in options.items():
-        X = _featurise_option(article, question, str(text), vec)
+    for idx, (label, text) in enumerate(zip(labels, texts)):
+        X = _featurise_option(article, question, text, vec,
+                                option_idx=idx, all_options=texts)
         # SVM has no predict_proba; sigmoid of decision_function is monotonic.
         p_svm = float(expit(svm.decision_function(X))[0])
         p = (lr.predict_proba(X)[0, 1] + p_svm + nb.predict_proba(X)[0, 1]) / 3.0

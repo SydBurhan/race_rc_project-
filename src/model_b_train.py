@@ -87,6 +87,55 @@ def _cosine(texts_a: list[str], texts_b: list[str], vectorizer) -> np.ndarray:
                               vectorizer.transform(texts_b))
 
 
+# ── Answer-type detection (for distractor plausibility filters) ───────────────
+_NUM_RE = re.compile(r"^\s*-?\d[\d,.\s]*\s*$")
+_YEAR_RE = re.compile(r"^\s*(19|20)\d{2}\s*$")
+
+
+def _answer_type(answer: str) -> str:
+    """Return one of: 'year', 'number', 'short' (1-2 words), 'phrase'."""
+    a = str(answer).strip()
+    if _YEAR_RE.match(a):
+        return "year"
+    if _NUM_RE.match(a):
+        return "number"
+    if 1 <= len(a.split()) <= 2:
+        return "short"
+    return "phrase"
+
+
+def _length_ok(candidate: str, answer: str, ratio: float = 2.0) -> bool:
+    """Distractor token count must be within `ratio`x of the answer length."""
+    nc = max(1, len(str(candidate).split()))
+    na = max(1, len(str(answer).split()))
+    return (1.0 / ratio) <= (nc / na) <= ratio
+
+
+def _matches_type(candidate: str, atype: str) -> bool:
+    """Filter candidates by the answer's type (year / number / phrase)."""
+    c = str(candidate).strip()
+    if atype == "year":
+        return bool(_YEAR_RE.match(c))
+    if atype == "number":
+        return bool(_NUM_RE.match(c))
+    # 'short' and 'phrase' accept anything non-numeric
+    return not _NUM_RE.match(c)
+
+
+def _redact_answer(sentence: str, answer: str, mask: str = "_____") -> str:
+    """Replace the answer string in a sentence with a blank, preserving case-insensitive match."""
+    if not answer:
+        return sentence
+    pat = re.compile(re.escape(str(answer)), re.IGNORECASE)
+    return pat.sub(mask, sentence)
+
+
+def _contains_answer(sentence: str, answer: str) -> bool:
+    if not answer:
+        return False
+    return str(answer).lower() in str(sentence).lower()
+
+
 def load_vectorizer(path: Path = OHE_PATH):
     if not path.exists():
         log.error("Vectorizer not found: %s. Run preprocessing.py first.", path)
@@ -268,6 +317,7 @@ def generate_distractors(article: str, question: str, correct_answer: str,
     pool.extend(get_word2vec_distractors(correct_answer, article, w2v_model, top_n=10))
 
     correct_lc = str(correct_answer).lower().strip()
+    atype = _answer_type(correct_answer)
     seen: set[str] = set()
     cleaned: list[str] = []
     for cand in pool:
@@ -280,8 +330,28 @@ def generate_distractors(article: str, question: str, correct_answer: str,
             continue
         if c_lc in seen:
             continue
+        # Plausibility filters: type + length
+        if not _matches_type(cand, atype):
+            continue
+        if not _length_ok(cand, correct_answer):
+            continue
         seen.add(c_lc)
         cleaned.append(cand)
+
+    # If filters were too aggressive (e.g. for 'year' types where the article
+    # has few year-like tokens), retry with type-only / no length constraint.
+    if len(cleaned) < n:
+        for cand in pool:
+            if not cand:
+                continue
+            c_lc = cand.lower().strip()
+            if (not c_lc or c_lc == correct_lc or c_lc in seen
+                    or c_lc in correct_lc or correct_lc in c_lc):
+                continue
+            seen.add(c_lc)
+            cleaned.append(cand)
+            if len(cleaned) >= n + 5:
+                break
 
     if not cleaned:
         return []
@@ -382,6 +452,13 @@ def _load_hint_scorer():
 
 def generate_hints(article: str, question: str, correct_answer: str = "",
                    vectorizer=None) -> list[str]:
+    """
+    Three graduated, non-spoiler hints:
+      1. GENERAL  — topical sentence relevant to the question (no answer leak).
+      2. SPECIFIC — context sentence that narrows the topic (no answer leak).
+      3. NEAR     — the sentence containing the answer, but with the answer
+                    redacted to '_____'. Forces the student to fill in the blank.
+    """
     if vectorizer is None:
         vectorizer = load_vectorizer()
     sentences = _split_sentences(article)
@@ -389,51 +466,70 @@ def generate_hints(article: str, question: str, correct_answer: str = "",
         return []
 
     bundle = _load_hint_scorer()
-
     n_sent = len(sentences)
     if bundle is not None:
         clf = bundle["clf"]
-        feats = []
-        for i, s in enumerate(sentences):
-            pos = i / max(1, n_sent - 1)
-            feats.append(_sentence_features(s, question, correct_answer,
-                                             pos, vectorizer))
-        X = np.vstack(feats)
-        scores = clf.predict_proba(X)[:, 1]
+        feats = [
+            _sentence_features(s, question, correct_answer,
+                                i / max(1, n_sent - 1), vectorizer)
+            for i, s in enumerate(sentences)
+        ]
+        scores = clf.predict_proba(np.vstack(feats))[:, 1]
     else:
         scores = _cosine(sentences, [question], vectorizer).ravel()
 
-    # Sort indices by score descending
     order = np.argsort(-scores)
     if len(order) == 0:
         return []
 
-    # Near-explicit (highest), specific (rank 2), general (median of top half)
-    near = sentences[order[0]]
-    specific = sentences[order[1]] if len(order) > 1 else near
-    top_half = order[: max(1, len(order) // 2)]
-    median_pos = top_half[len(top_half) // 2]
-    general = sentences[median_pos]
+    # Partition by whether the sentence contains the answer
+    answer_sentences = [i for i in order if _contains_answer(sentences[i], correct_answer)]
+    safe_sentences = [i for i in order if not _contains_answer(sentences[i], correct_answer)]
 
-    # Ensure 3 unique hints when possible
-    out = [general, specific, near]
-    seen, deduped = set(), []
-    for h in out:
+    # 3rd hint (NEAR): top answer-containing sentence, with answer redacted
+    if answer_sentences and correct_answer:
+        near = _redact_answer(sentences[answer_sentences[0]], correct_answer)
+    elif safe_sentences:
+        near = sentences[safe_sentences[0]]
+    else:
+        near = sentences[order[0]]
+
+    # 2nd hint (SPECIFIC): top non-answer-containing sentence by hint score
+    if len(safe_sentences) >= 1:
+        specific = sentences[safe_sentences[0]]
+    else:
+        specific = near
+
+    # 1st hint (GENERAL): a more topical sentence — pick from middle of safe ranking
+    if len(safe_sentences) >= 2:
+        mid = safe_sentences[len(safe_sentences) // 2]
+        general = sentences[mid]
+    elif len(sentences) >= 1:
+        # Fall back to the first sentence of the article (typical topic sentence)
+        general = sentences[0] if not _contains_answer(sentences[0], correct_answer) \
+                                  else _redact_answer(sentences[0], correct_answer)
+    else:
+        general = specific
+
+    # Deduplicate while preserving order: general, specific, near
+    out, seen = [], set()
+    for h in (general, specific, near):
         key = h.strip().lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(h)
-    # Pad with remaining sorted sentences if needed
-    for i in order:
-        if len(deduped) >= 3:
+        if key and key not in seen:
+            seen.add(key)
+            out.append(h)
+
+    # Pad with additional safe sentences if we still don't have 3
+    for i in safe_sentences:
+        if len(out) >= 3:
             break
         s = sentences[i]
-        if s.strip().lower() in seen:
-            continue
-        seen.add(s.strip().lower())
-        deduped.append(s)
-    return deduped[:3]
+        key = s.strip().lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+
+    return out[:3]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
