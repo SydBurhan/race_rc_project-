@@ -1,0 +1,35 @@
+{
+  "model_a": {
+    "bleu_1": 0.1753,
+    "bleu_2": 0.0808,
+    "bleu_3": 0.0437,
+    "bleu_4": 0.0229,
+    "rouge_l_precision": 0.1752,
+    "rouge_l_recall": 0.1623,
+    "rouge_l_f1": 0.1634,
+    "meteor": 0.1373,
+    "num_samples": 500
+  },
+  "model_b_distractors": {
+    "bleu_1": 0.0023,
+    "bleu_2": 0.0006,
+    "bleu_3": 0.0002,
+    "bleu_4": 0.0001,
+    "rouge_l_precision": 0.0935,
+    "rouge_l_recall": 0.0238,
+    "rouge_l_f1": 0.034,
+    "meteor": 0.0132,
+    "num_samples": 1500
+  },
+  "model_b_hints": {
+    "bleu_1": 0.2961,
+    "bleu_2": 0.2081,
+    "bleu_3": 0.1803,
+    "bleu_4": 0.1678,
+    "rouge_l_precision": 0.1893,
+    "rouge_l_recall": 0.1999,
+    "rouge_l_f1": 0.1856,
+    "meteor": 0.2012,
+    "num_samples": 500
+  }
+}
