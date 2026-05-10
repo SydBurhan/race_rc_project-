@@ -69,22 +69,97 @@ def _clean_text(text: str) -> str:
     return text
 
 
-def load_raw_csv(split: str) -> pd.DataFrame:
-    path = RAW_DIR / f"{split}.csv"
-    if not path.exists():
-        log.error("Missing raw CSV: %s", path)
-        sys.exit(1)
-    df = pd.read_csv(path)
+def _validate_and_clean(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    # Drop pandas-index leakage columns like "Unnamed: 0"
+    drop_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
     required = {"id", "article", "question", "A", "B", "C", "D", "answer"}
     missing = required - set(df.columns)
     if missing:
-        log.error("CSV %s missing columns: %s", path, missing)
+        log.error("CSV %s missing columns: %s", source, missing)
         sys.exit(1)
     df = df.dropna(subset=["article", "question", "answer"]).reset_index(drop=True)
     df["answer"] = df["answer"].astype(str).str.strip().str.upper()
     df = df[df["answer"].isin(OPTIONS)].reset_index(drop=True)
-    log.info("Loaded %s: %d rows", split, len(df))
     return df
+
+
+def _resolve_split_path(split: str) -> Path | None:
+    """Locate split CSV, accepting common aliases (val/dev/validation)."""
+    aliases = {
+        "train": ["train.csv"],
+        "val":   ["val.csv", "dev.csv", "validation.csv"],
+        "test":  ["test.csv"],
+    }
+    for name in aliases.get(split, [f"{split}.csv"]):
+        p = RAW_DIR / name
+        if p.exists():
+            return p
+    return None
+
+
+def load_raw_csv(split: str) -> pd.DataFrame:
+    path = _resolve_split_path(split)
+    if path is None:
+        log.error("Missing raw CSV for split=%s in %s", split, RAW_DIR)
+        sys.exit(1)
+    df = _validate_and_clean(pd.read_csv(path), str(path))
+    log.info("Loaded %s from %s: %d rows", split, path.name, len(df))
+    return df
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int]:
+    """Cheap duplicate-file detection: (file_size, mtime-rounded)."""
+    s = path.stat()
+    return (s.st_size, int(s.st_mtime))
+
+
+def _looks_like_duplicates(paths: list[Path]) -> bool:
+    sizes = {p.stat().st_size for p in paths if p and p.exists()}
+    return len(sizes) == 1 and len(paths) >= 2
+
+
+def load_or_split_raw() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Load train/val/test CSVs from data/raw/ (val accepts dev.csv / validation.csv).
+    Falls back to an 80/10/10 random split of train.csv (random_state=42) when:
+      * val/test are missing, OR
+      * train/val/test files are byte-identical (data leakage).
+    """
+    train_path = _resolve_split_path("train")
+    val_path = _resolve_split_path("val")
+    test_path = _resolve_split_path("test")
+
+    if not train_path:
+        log.error("Missing data/raw/train.csv. Cannot proceed.")
+        sys.exit(1)
+
+    have_all_three = val_path and test_path
+    if have_all_three:
+        existing = [train_path, val_path, test_path]
+        if _looks_like_duplicates(existing):
+            log.warning("train / val / test CSVs are byte-identical "
+                        "(%s). Falling back to auto-split to avoid leakage.",
+                        ", ".join(p.name for p in existing))
+        else:
+            return (load_raw_csv("train"),
+                    load_raw_csv("val"),
+                    load_raw_csv("test"))
+
+    log.warning("Auto-splitting %s into 80/10/10 train/val/test "
+                "(random_state=42).", train_path.name)
+    full = _validate_and_clean(pd.read_csv(train_path), str(train_path))
+    full = full.sample(frac=1.0, random_state=42).reset_index(drop=True)
+    n = len(full)
+    n_train = int(n * 0.8)
+    n_val = int(n * 0.1)
+    train_df = full.iloc[:n_train].reset_index(drop=True)
+    val_df = full.iloc[n_train: n_train + n_val].reset_index(drop=True)
+    test_df = full.iloc[n_train + n_val:].reset_index(drop=True)
+    log.info("Split sizes: train=%d val=%d test=%d",
+             len(train_df), len(val_df), len(test_df))
+    return train_df, val_df, test_df
 
 
 def save_processed_csv(df: pd.DataFrame, split: str) -> None:
@@ -235,10 +310,8 @@ def run_preprocessing() -> None:
     MODEL_A_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_A_TRAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load raw CSVs
-    train_df = load_raw_csv("train")
-    val_df = load_raw_csv("val")
-    test_df = load_raw_csv("test")
+    # 1. Load raw CSVs (auto-splits train.csv if val/test missing)
+    train_df, val_df, test_df = load_or_split_raw()
 
     # 2. Persist cleaned doc-level CSVs (for downstream model_b/template_generator)
     for split, df in (("train", train_df), ("val", val_df), ("test", test_df)):

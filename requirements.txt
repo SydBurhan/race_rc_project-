@@ -1,8 +1,11 @@
 streamlit>=1.35.0
 scikit-learn>=1.4.0
 xgboost>=2.0.0
-gensim>=4.3.0
 nltk>=3.8.0
+# gensim is OPTIONAL — only used for Word2Vec distractor enrichment.
+# Install manually on Python <=3.12:  pip install "gensim>=4.3.0"
+# On Python 3.13+ (no upstream wheel yet) the distractor pipeline silently
+# falls back to TF-IDF + frequency strategies, which is fine for this project.
 rouge-score>=0.1.2
 pandas>=2.1.0
 numpy>=1.26.0

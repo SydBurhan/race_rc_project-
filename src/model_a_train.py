@@ -66,12 +66,31 @@ RESULTS_PATH = MODEL_A_TRAD / "training_results.json"
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
 LR_PARAMS = dict(C=1.0, max_iter=1000, solver="liblinear",
                  random_state=42, class_weight="balanced")
-SVM_PARAMS = dict(C=1.0, max_iter=3000, random_state=42, class_weight="balanced")
+SVM_PARAMS = dict(C=0.05, max_iter=3000, random_state=42, class_weight="balanced")
 NB_PARAMS = dict(alpha=0.3)
-RF_PARAMS = dict(n_estimators=200, class_weight="balanced",
+# RF on sparse 15k-feature data is expensive; keep modest defaults.
+RF_PARAMS = dict(n_estimators=80, max_depth=24, max_features="sqrt",
+                 min_samples_leaf=4, class_weight="balanced",
                  random_state=42, n_jobs=-1)
-XGB_PARAMS = dict(n_estimators=200, eval_metric="logloss",
-                  random_state=42, n_jobs=-1)
+def _detect_xgb_device() -> str:
+    """Return 'cuda' if XGBoost can see a GPU, else 'cpu'."""
+    try:
+        import xgboost as _xgb
+        # Probe with a tiny matrix; XGBoost falls back gracefully when no GPU.
+        import numpy as _np
+        dtrain = _xgb.DMatrix(_np.zeros((2, 2)), label=_np.array([0, 1]))
+        _xgb.train({"device": "cuda", "tree_method": "hist"}, dtrain,
+                    num_boost_round=1)
+        return "cuda"
+    except Exception:
+        return "cpu"
+
+
+# XGBoost: hist + GPU when available (5-10x speedup on Colab/Kaggle).
+_XGB_DEVICE = _detect_xgb_device()
+XGB_PARAMS = dict(n_estimators=150, max_depth=6, tree_method="hist",
+                  device=_XGB_DEVICE, learning_rate=0.1,
+                  eval_metric="logloss", random_state=42, n_jobs=-1)
 KM_PARAMS = dict(n_clusters=4, n_init=10, random_state=42)
 LP_PARAMS = dict(kernel="knn", n_neighbors=7, max_iter=1000)
 
@@ -164,7 +183,7 @@ def train_supervised(X_tr, y_tr, X_va, y_va, vocab_size: int) -> tuple[dict, dic
     models["rf"] = rf
     _print_top_features("RandomForest", rf.feature_importances_, vocab_size)
 
-    log.info("Training XGBoost ...")
+    log.info("Training XGBoost on device=%s ...", _XGB_DEVICE)
     xgb_clf = xgb.XGBClassifier(**XGB_PARAMS)
     xgb_clf.fit(X_tr, y_tr)
     metrics["XGB"] = _report("XGBoost", xgb_clf, X_va, y_va)
